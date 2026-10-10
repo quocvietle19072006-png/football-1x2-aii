@@ -1,321 +1,568 @@
 import math
-import os
 from datetime import datetime, timezone
-from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-# All-sport odds scanner and market-probability analyzer.
-# Predictions derived from odds are market-implied estimates, not an independent model.
-API_BASE = "https://api.the-odds-api.com/v4"
-TIMEOUT = 25
+BASE_URL = "https://sportapi.ai/api"
 
-st.set_page_config(page_title="All-Sport & Esports Odds Lab", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Football 1X2 AI", page_icon="⚽", layout="centered")
 
-st.title("🎯 All-Sport & Esports Odds Lab")
-st.caption("Quét odds • xác suất thị trường đã loại biên • so sánh giá • lọc kèo")
+st.title("⚽ Football AI — Multi Market")
+st.caption("Dữ liệu lịch sử + sân nhà/sân khách + phong độ + standings + H2H → 1X2, O/U, BTTS, tỷ số")
 
-st.warning(
-    "Lưu ý: ứng dụng không thể bảo đảm thắng cược. Xác suất thị trường bên dưới được tính từ odds nhà cái "
-    "(đã loại phần biên khi đủ dữ liệu), không phải xác suất dự đoán độc lập. "
-    "Không tự tạo kèo khi API không trả dữ liệu."
-)
+if "SPORTAPI_KEY" not in st.secrets or not st.secrets["SPORTAPI_KEY"]:
+    st.error("Chưa có SPORTAPI_KEY trong Secrets.")
+    st.info('Thêm: SPORTAPI_KEY = "API_KEY_CỦA_BẠN"')
+    st.stop()
 
-def get_secret(name: str, default: str = "") -> str:
-    try:
-        value = st.secrets.get(name, default)
-        if value:
-            return str(value).strip()
-    except Exception:
-        pass
-    return os.getenv(name, default).strip()
+API_KEY = st.secrets["SPORTAPI_KEY"]
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "X-Api-Key": API_KEY,
+    "Accept": "application/json",
+}
 
-api_key = get_secret("THE_ODDS_API_KEY")
-with st.sidebar:
-    st.header("Cài đặt")
-    if not api_key:
-        st.error("Chưa có THE_ODDS_API_KEY.")
-        st.markdown(
-            "Trong Streamlit → Manage app → Settings → Secrets, thêm:\n\n"
-            "```toml\nTHE_ODDS_API_KEY = \"API_KEY_CUA_BAN\"\n```"
-        )
-    else:
-        st.success("Đã tìm thấy cấu hình API key (không hiển thị key).")
-    regions = st.selectbox("Khu vực nhà cái", ["us", "uk", "eu", "au", "us,uk,eu"], index=0)
-    odds_format_label = st.selectbox("Định dạng odds", ["Decimal", "American"], index=0)
-    odds_format = "decimal" if odds_format_label == "Decimal" else "american"
-    include_live = st.checkbox("Hiển thị trận đang diễn ra nếu API trả về", value=True)
-    market_choices = st.multiselect(
-        "Thị trường cần tải",
-        ["h2h", "spreads", "totals", "outrights"],
-        default=["h2h", "spreads", "totals"],
-        format_func=lambda x: {
-            "h2h": "Moneyline / 1X2",
-            "spreads": "Handicap / Spread",
-            "totals": "Tài / Xỉu",
-            "outrights": "Vô địch / Outright",
-        }[x],
-    )
-    min_edge = st.slider("Ngưỡng chênh lệch so với xác suất thị trường (%)", 0, 15, 3)
-    st.caption("Ngưỡng này chỉ sàng lọc chênh lệch giá giữa các nhà cái; không phải cam kết có lợi thế thật.")
 
-def api_get(path: str, params: dict | None = None):
-    if not api_key:
-        raise RuntimeError("Thiếu THE_ODDS_API_KEY trong Streamlit Secrets.")
-    p = dict(params or {})
-    p["apiKey"] = api_key
-    try:
-        r = requests.get(f"{API_BASE}{path}", params=p, timeout=TIMEOUT)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Không kết nối được API: {e}") from e
-    if r.status_code == 401:
-        raise RuntimeError("API key bị từ chối (401). Hãy kiểm tra key tại nhà cung cấp, không dán key vào chat.")
-    if r.status_code == 403:
-        raise RuntimeError("API key hợp lệ nhưng gói hiện tại không có quyền truy cập môn/thị trường này (403).")
-    if r.status_code == 429:
-        raise RuntimeError("Đã hết hạn mức request của API (429). Hãy chờ quota làm mới hoặc kiểm tra gói dịch vụ.")
-    if not r.ok:
+def api_get(path, params=None):
+    r = requests.get(BASE_URL + path, headers=HEADERS, params=params, timeout=20)
+    if r.status_code >= 400:
         try:
             detail = r.json()
         except Exception:
-            detail = r.text[:300]
-        raise RuntimeError(f"API trả lỗi HTTP {r.status_code}: {detail}")
+            detail = r.text
+        raise RuntimeError(f"HTTP {r.status_code}: {detail}")
     try:
-        return r.json(), r.headers
-    except ValueError as e:
-        raise RuntimeError("API trả dữ liệu không phải JSON.") from e
+        data = r.json()
+    except ValueError:
+        # SportAPI may prepend a PHP warning/HTML before the JSON body.
+        # Extract the JSON object beginning with the actual API payload.
+        import json
+        raw = r.text.lstrip("\ufeff \r\n\t")
+        start = raw.find('{"success"')
+        if start < 0:
+            start = raw.find('{')
+        if start >= 0:
+            candidate = raw[start:]
+            try:
+                data = json.loads(candidate)
+            except ValueError:
+                # Try the last closing brace in case there is trailing HTML.
+                end = candidate.rfind('}')
+                if end >= 0:
+                    try:
+                        data = json.loads(candidate[:end + 1])
+                    except ValueError:
+                        data = None
+                else:
+                    data = None
+        else:
+            data = None
+        if data is None:
+            ct = r.headers.get("content-type", "")
+            preview = r.text[:700].replace("\n", " ").strip()
+            raise RuntimeError(
+                f"API không trả JSON hợp lệ (HTTP {r.status_code}, Content-Type: {ct}). "
+                f"Phản hồi: {preview}"
+            )
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(str(data))
+    return data
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_sports(_key_marker: str):
-    data, headers = api_get("/sports/", {})
-    return data, {k: v for k, v in headers.items() if k.lower().startswith("x-requests-")}
 
-@st.cache_data(ttl=90, show_spinner=False)
-def load_odds(sport_key: str, regions: str, markets: str, odds_format: str, _key_marker: str):
-    data, headers = api_get(f"/sports/{sport_key}/odds/", {
-        "regions": regions,
-        "markets": markets,
-        "oddsFormat": odds_format,
-        "dateFormat": "iso",
-    })
-    return data, {k: v for k, v in headers.items() if k.lower().startswith("x-requests-")}
+def as_list(value):
+    return value if isinstance(value, list) else []
 
-def decimal_odds(price: Any, fmt: str) -> float | None:
-    try:
-        p = float(price)
-        if fmt == "decimal":
-            return p if p > 1 else None
-        if p > 0:
-            return 1 + p / 100
-        if p < 0:
-            return 1 + 100 / abs(p)
-    except (ValueError, TypeError, ZeroDivisionError):
-        return None
-    return None
 
-def prob_from_price(price: Any, fmt: str) -> float | None:
-    d = decimal_odds(price, fmt)
-    return 1 / d if d and d > 1 else None
-
-def build_rows(events: list[dict], fmt: str):
+def get_leagues():
+    data = api_get("/leagues")
     rows = []
-    for event in events:
-        books = event.get("bookmakers") or []
-        for market_key in sorted({m.get("key", "") for b in books for m in b.get("markets", [])}):
-            market_entries = []
-            for book in books:
-                for market in book.get("markets", []):
-                    if market.get("key") == market_key:
-                        for outcome in market.get("outcomes", []):
-                            price = outcome.get("price")
-                            dec = decimal_odds(price, fmt)
-                            implied = (1 / dec) if dec else None
-                            market_entries.append({
-                                "event": f"{event.get('home_team', event.get('name',''))} vs {event.get('away_team','')}".strip(" vs"),
-                                "start": event.get("commence_time", ""),
-                                "market_key": market_key,
-                                "selection": outcome.get("name", ""),
-                                "description": outcome.get("description", ""),
-                                "point": outcome.get("point"),
-                                "book": book.get("title", book.get("key", "")),
-                                "odds": price,
-                                "decimal": dec,
-                                "implied": implied,
-                                "event_id": event.get("id", ""),
-                                "sport_key": event.get("sport_key", ""),
-                            })
-            # Approximate fair probabilities by removing overround within each bookmaker's market group.
-            # Group by bookmaker and point to avoid mixing alternate lines.
-            grouped: dict[tuple, list[int]] = {}
-            for i, row in enumerate(market_entries):
-                group_key = (row["book"], None if row["market_key"] == "spreads" else row["point"])
-                grouped.setdefault(group_key, []).append(i)
-            fair_by_row = {}
-            for _, indexes in grouped.items():
-                valid = [(i, market_entries[i]["implied"]) for i in indexes if market_entries[i]["implied"] is not None]
-                total = sum(p for _, p in valid)
-                if total > 0:
-                    for i, p in valid:
-                        fair_by_row[i] = p / total
-            # Compare each selection's best available odds with median fair probability across books.
-            selection_groups: dict[tuple, list[int]] = {}
-            for i, row in enumerate(market_entries):
-                selection_groups.setdefault((row["selection"], row["description"], row["point"]), []).append(i)
-            for key, indexes in selection_groups.items():
-                fair_vals = [fair_by_row[i] for i in indexes if i in fair_by_row]
-                if not fair_vals:
-                    continue
-                fair = sum(fair_vals) / len(fair_vals)
-                best_i = max((i for i in indexes if market_entries[i]["decimal"]), key=lambda i: market_entries[i]["decimal"], default=None)
-                for i in indexes:
-                    row = market_entries[i]
-                    row["market_fair_prob"] = fair
-                    row["best_decimal"] = market_entries[best_i]["decimal"] if best_i is not None else None
-                    row["best_book"] = market_entries[best_i]["book"] if best_i is not None else ""
-                    row["best_implied_prob"] = 1 / row["best_decimal"] if row["best_decimal"] else None
-                    row["edge_pp"] = (fair - row["best_implied_prob"]) * 100 if row["best_implied_prob"] is not None else None
-                    rows.append(row)
+    groups = data.get("data", data.get("leagues", [])) if isinstance(data, dict) else []
+    if isinstance(groups, dict):
+        groups = [groups]
+    for group in groups:
+        country = group.get("country", "") if isinstance(group, dict) else ""
+        leagues = group.get("leagues", []) if isinstance(group, dict) else []
+        for lg in leagues:
+            if isinstance(lg, dict) and lg.get("id") is not None:
+                rows.append({"id": lg["id"], "name": lg.get("name", ""), "country": country})
     return rows
 
-if not api_key:
-    st.info("Thêm THE_ODDS_API_KEY vào Secrets trước khi tải dữ liệu.")
-    st.stop()
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_leagues():
+    return get_leagues()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def league_detail(league_id):
+    return api_get(f"/leagues/{league_id}")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fixture_detail(fixture_id):
+    return api_get(f"/fixtures/{fixture_id}")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def team_detail(team_id):
+    return api_get(f"/teams/{team_id}")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def h2h_detail(team1, team2):
+    return api_get(f"/fixtures/h2h/{team1}/{team2}")
+
+
+def fixture_list_from_league(data):
+    league = data.get("league", {}) if isinstance(data, dict) else {}
+    fixtures = league.get("upcoming_fixtures", []) if isinstance(league, dict) else []
+    if not fixtures and isinstance(data, dict):
+        fixtures = data.get("upcoming_fixtures", data.get("fixtures", []))
+    return as_list(fixtures)
+
+
+def parse_dt(x):
+    if not x:
+        return None
+    try:
+        s = str(x).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def fixture_id(f):
+    return f.get("id") or f.get("fixture_id")
+
+
+def team_name(f, side):
+    keys = [f"{side}_team", f"{side}_name"]
+    for k in keys:
+        if f.get(k):
+            return str(f[k])
+    obj = f.get(side)
+    if isinstance(obj, dict):
+        return str(obj.get("name", obj.get("team_name", "")))
+    return ""
+
+
+def team_id_from_fixture(f, side):
+    for k in (f"{side}_team_id", f"{side}_id"):
+        if f.get(k) is not None:
+            return f.get(k)
+    obj = f.get(side)
+    if isinstance(obj, dict):
+        return obj.get("id") or obj.get("team_id")
+    return None
+
+
+def future_fixtures(league_id):
+    data = league_detail(league_id)
+    fixtures = fixture_list_from_league(data)
+    now = datetime.now(timezone.utc)
+    out = []
+    for f in fixtures:
+        dt = parse_dt(f.get("datetime") or f.get("date_time") or f.get("kickoff"))
+        if dt is None:
+            # Some responses expose only date. Keep it if it is clearly future.
+            try:
+                d = datetime.fromisoformat(str(f.get("date")))
+                dt = d.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        status = str(f.get("status", "")).upper()
+        if dt >= now and status not in {"FT", "AET", "PEN", "FINISHED"}:
+            f = dict(f)
+            f["_dt"] = dt
+            out.append(f)
+    out.sort(key=lambda x: x["_dt"])
+    return out
+
+
+def extract_matches(team_data):
+    team = team_data.get("team", {}) if isinstance(team_data, dict) else {}
+    matches = []
+    for source in [team.get("matches"), team_data.get("matches") if isinstance(team_data, dict) else None]:
+        if isinstance(source, list):
+            matches.extend(source)
+    # de-duplicate
+    seen = set()
+    out = []
+    for m in matches:
+        mid = m.get("id") or m.get("fixture_id")
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append(m)
+    return out
+
+
+def norm_name(x):
+    return " ".join(str(x or "").lower().replace("-", " ").split())
+
+
+def result_for_team(m, team_id=None, team_name_value=""):
+    hs = m.get("home_score")
+    aws = m.get("away_score")
+    if hs is None or aws is None:
+        # Some responses may nest scores.
+        scores = m.get("score") if isinstance(m.get("score"), dict) else {}
+        hs = scores.get("home", hs)
+        aws = scores.get("away", aws)
+    try:
+        hs, aws = float(hs), float(aws)
+    except Exception:
+        return None
+
+    home_id = m.get("home_team_id") or m.get("home_id")
+    away_id = m.get("away_team_id") or m.get("away_id")
+    home_obj = m.get("home_team")
+    away_obj = m.get("away_team")
+    home_name = home_obj.get("name", "") if isinstance(home_obj, dict) else str(home_obj or "")
+    away_name = away_obj.get("name", "") if isinstance(away_obj, dict) else str(away_obj or "")
+    if isinstance(home_obj, dict):
+        home_id = home_id or home_obj.get("id") or home_obj.get("team_id")
+    if isinstance(away_obj, dict):
+        away_id = away_id or away_obj.get("id") or away_obj.get("team_id")
+
+    is_home = False
+    if team_id is not None and (home_id == team_id or str(home_id) == str(team_id)):
+        is_home = True
+        belongs = True
+    elif team_id is not None and (away_id == team_id or str(away_id) == str(team_id)):
+        is_home = False
+        belongs = True
+    else:
+        q = norm_name(team_name_value)
+        belongs_home = q and q == norm_name(home_name)
+        belongs_away = q and q == norm_name(away_name)
+        if not (belongs_home or belongs_away):
+            return None
+        is_home = belongs_home
+        belongs = True
+
+    if not belongs:
+        return None
+    gf, ga = (hs, aws) if is_home else (aws, hs)
+    pts = 3 if gf > ga else 1 if gf == ga else 0
+    return {"gf": gf, "ga": ga, "pts": pts, "home": is_home,
+            "date": m.get("date") or m.get("datetime") or m.get("kickoff") or ""}
+
+
+def weighted_mean(values, decay=0.88):
+    if not values:
+        return None
+    weights = np.array([decay ** i for i in range(len(values))], dtype=float)
+    vals = np.array(values, dtype=float)
+    return float(np.sum(vals * weights) / np.sum(weights))
+
+
+def team_form(team_id, team_name_value=""):
+    data = team_detail(team_id)
+    team_obj = data.get("team", {}) if isinstance(data, dict) else {}
+    real_name = team_obj.get("name", team_name_value) if isinstance(team_obj, dict) else team_name_value
+    matches = extract_matches(data)
+    vals = [result_for_team(m, team_id, real_name) for m in matches]
+    vals = [v for v in vals if v]
+    vals.sort(key=lambda x: str(x["date"]), reverse=True)
+    vals = vals[:20]
+    if not vals:
+        return {"n": 0}
+
+    gf = weighted_mean([v["gf"] for v in vals])
+    ga = weighted_mean([v["ga"] for v in vals])
+    pts = weighted_mean([v["pts"] for v in vals])
+    home_vals = [v for v in vals if v["home"]][:10]
+    away_vals = [v for v in vals if not v["home"]][:10]
+    return {
+        "n": len(vals),
+        "ppg": pts,
+        "gf": gf,
+        "ga": ga,
+        "home_n": len(home_vals),
+        "away_n": len(away_vals),
+        "home_ppg": weighted_mean([v["pts"] for v in home_vals]) if home_vals else pts,
+        "away_ppg": weighted_mean([v["pts"] for v in away_vals]) if away_vals else pts,
+        "home_gf": weighted_mean([v["gf"] for v in home_vals]) if home_vals else gf,
+        "home_ga": weighted_mean([v["ga"] for v in home_vals]) if home_vals else ga,
+        "away_gf": weighted_mean([v["gf"] for v in away_vals]) if away_vals else gf,
+        "away_ga": weighted_mean([v["ga"] for v in away_vals]) if away_vals else ga,
+        "source": "20_match_weighted",
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def league_standings(league_id):
+    return api_get(f"/standings/{league_id}")
+
+
+def form_score(form):
+    vals = []
+    for x in form if isinstance(form, list) else []:
+        x = str(x).upper().strip()
+        if x == "W": vals.append(3)
+        elif x == "D": vals.append(1)
+        elif x == "L": vals.append(0)
+    return sum(vals) / len(vals) if vals else None
+
+
+def standings_form(league_id, team_id, team_name_value=""):
+    data = league_standings(league_id)
+    obj = data.get("data", {}) if isinstance(data, dict) else {}
+    rows = obj.get("standings", []) if isinstance(obj, dict) else []
+    q = norm_name(team_name_value)
+    for row in rows if isinstance(rows, list) else []:
+        rteam = row.get("team", {}) if isinstance(row, dict) else {}
+        rid = row.get("team_id") or row.get("id") or (rteam.get("id") if isinstance(rteam, dict) else None)
+        rname = row.get("team_name") or (rteam.get("name") if isinstance(rteam, dict) else "")
+        if (team_id is not None and str(rid) == str(team_id)) or (q and q == norm_name(rname)):
+            f = row.get("form")
+            score = form_score(f)
+            if score is not None:
+                return {"n": len(f), "ppg": score, "gf": None, "ga": None, "source": "standings"}
+    return {"n": 0}
+
+
+def get_team_signal(league_id, team_id, team_name_value):
+    tf = team_form(team_id, team_name_value)
+    if tf.get("n", 0) >= 3:
+        return tf
+    sf = standings_form(league_id, team_id, team_name_value)
+    if sf.get("n", 0) > 0:
+        return sf
+    return {"n": 0}
+
+def poisson_matrix(lam_home, lam_away, max_goals=10):
+    ph = np.array([math.exp(-lam_home) * lam_home**k / math.factorial(k) for k in range(max_goals + 1)])
+    pa = np.array([math.exp(-lam_away) * lam_away**k / math.factorial(k) for k in range(max_goals + 1)])
+    m = np.outer(ph, pa)
+    return m / m.sum()
+
+
+def probs_1x2(matrix):
+    home = float(np.tril(matrix, -1).sum())
+    draw = float(np.trace(matrix))
+    away = float(np.triu(matrix, 1).sum())
+    return {"1": home, "X": draw, "2": away}
+
+
+def over_under(matrix, line):
+    under = 0.0
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            if i + j < line:
+                under += float(matrix[i, j])
+    return {"Over": 1.0 - under, "Under": under}
+
+
+def btts_probs(matrix):
+    no = float(matrix[0, :].sum() + matrix[:, 0].sum() - matrix[0, 0])
+    return {"Có": 1.0 - no, "Không": no}
+
+
+def top_scores(matrix, n=5):
+    rows=[]
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            rows.append((float(matrix[i,j]), i, j))
+    rows.sort(reverse=True)
+    return rows[:n]
+
+
+def h2h_signal(data, home_id, away_id):
+    if not isinstance(data, dict):
+        return {"n": 0}
+    fixtures = data.get("fixtures", [])
+    if not isinstance(fixtures, list):
+        return {"n": 0}
+    vals=[]
+    for m in fixtures[:10]:
+        r=result_for_team(m, home_id, "")
+        if r:
+            vals.append(r["pts"])
+    if not vals:
+        return {"n": 0}
+    return {"n": len(vals), "ppg": float(np.mean(vals))}
+
+
+def safe_lambdas(hf, af, h2h, league_avg=2.55):
+    # Ensemble of recent weighted form, venue splits and a small H2H prior.
+    # League average is used only as shrinkage, not as a fabricated team result.
+    home_attack = max(0.20, 0.65*hf.get("home_gf", hf["gf"]) + 0.35*hf["gf"])
+    away_attack = max(0.20, 0.65*af.get("away_gf", af["gf"]) + 0.35*af["gf"])
+    home_def = max(0.20, 0.65*hf.get("home_ga", hf["ga"]) + 0.35*hf["ga"])
+    away_def = max(0.20, 0.65*af.get("away_ga", af["ga"]) + 0.35*af["ga"])
+
+    home_base = 0.48*home_attack + 0.32*away_def + 0.20*(league_avg/2)
+    away_base = 0.48*away_attack + 0.32*home_def + 0.20*(league_avg/2)
+    venue_diff = hf.get("home_ppg", hf["ppg"]) - af.get("away_ppg", af["ppg"])
+    form_diff = hf["ppg"] - af["ppg"]
+    home = home_base + 0.16*venue_diff + 0.10*form_diff + 0.12
+    away = away_base - 0.10*venue_diff - 0.06*form_diff
+
+    if h2h.get("n", 0) >= 3:
+        hdiff = h2h["ppg"] - 1.5
+        home += 0.04*hdiff
+        away -= 0.02*hdiff
+
+    return float(np.clip(home, 0.25, 3.8)), float(np.clip(away, 0.20, 3.5))
+
+
+def league_goal_average(data):
+    if not isinstance(data, dict):
+        return 2.55
+    league = data.get("league", {}) if isinstance(data.get("league"), dict) else {}
+    results = league.get("recent_results", []) if isinstance(league, dict) else []
+    if not results and isinstance(data, dict):
+        results = data.get("recent_results", [])
+    goals=[]
+    for m in results if isinstance(results,list) else []:
+        hs=m.get("home_score"); aws=m.get("away_score")
+        try:
+            if hs is not None and aws is not None:
+                goals.append(float(hs)+float(aws))
+        except Exception:
+            pass
+    return float(np.mean(goals)) if goals else 2.55
+
 
 try:
-    with st.spinner("Đang tải danh mục môn thể thao từ API..."):
-        sports, quota = load_sports(api_key[-4:])
+    leagues = cached_leagues()
 except Exception as e:
-    st.error(str(e))
-    st.markdown("Nếu key vừa được cập nhật, hãy vào **Manage app → ⋮ → Reboot app** rồi thử lại.")
+    st.error(f"Không tải được danh sách giải: {e}")
     st.stop()
 
-if not sports:
-    st.warning("API không trả về danh mục môn thể thao. Kiểm tra gói API và key.")
+country_options = sorted({x["country"] for x in leagues if x["country"]})
+st.subheader("🌍 Quốc gia")
+country = st.selectbox("", ["Tất cả"] + country_options, label_visibility="collapsed")
+
+filtered = [x for x in leagues if country == "Tất cả" or x["country"] == country]
+search = st.text_input("🔎 Tìm giải", placeholder="Ví dụ: National League")
+if search.strip():
+    q = search.strip().lower()
+    filtered = [x for x in filtered if q in x["name"].lower() or q in x["country"].lower()]
+
+if not filtered:
+    st.warning("Không tìm thấy giải phù hợp.")
     st.stop()
 
-# Display all sports exposed by the current key, including esports if the subscription exposes them.
-sports = sorted(sports, key=lambda s: (str(s.get("group", "")), str(s.get("title", ""))))
-sport_groups: dict[str, list[dict]] = {}
-for sport in sports:
-    sport_groups.setdefault(sport.get("group", "Other"), []).append(sport)
+labels = [f"{x['country']} — {x['name']}" for x in filtered]
+choice = st.selectbox("🏆 Chọn giải đấu", labels)
+selected_league = filtered[labels.index(choice)]
 
-st.subheader("Chọn môn / giải đấu")
-group_names = list(sport_groups.keys())
-group = st.selectbox("Nhóm môn", group_names)
-group_sports = sport_groups[group]
-sport_labels = [f"{s.get('title', s.get('key'))}  ({s.get('key')})" for s in group_sports]
-chosen_label = st.selectbox("Môn / giải đấu", sport_labels)
-sport = group_sports[sport_labels.index(chosen_label)]
-sport_key = sport.get("key")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Môn/giải khả dụng với key", len(sports))
-col2.metric("Nhóm môn", len(sport_groups))
-col3.metric("Mã giải đang chọn", sport_key or "—")
-
-if not market_choices:
-    st.warning("Hãy chọn ít nhất một thị trường.")
+try:
+    fixtures = future_fixtures(selected_league["id"])
+except Exception as e:
+    st.error(f"Không tải được các trận tương lai: {e}")
     st.stop()
 
-if st.button("🔄 Tải odds và phân tích", type="primary", use_container_width=True):
-    st.session_state["run_scan"] = True
+if not fixtures:
+    st.info("Giải này hiện chưa có trận tương lai trong dữ liệu SportAPI.")
+    st.stop()
 
-if st.session_state.get("run_scan"):
-    try:
-        with st.spinner(f"Đang tải odds cho {sport.get('title', sport_key)}..."):
-            events, quota = load_odds(sport_key, regions, ",".join(market_choices), odds_format, api_key[-4:])
-        if not events:
-            st.warning(
-                "API không trả trận/odds cho lựa chọn này. Có thể hiện không có trận, môn này chưa được gói hỗ trợ, "
-                "hoặc sự kiện chưa mở thị trường. Thử giải khác hoặc giảm số market."
+fixture_labels = []
+for f in fixtures:
+    dt = f["_dt"].astimezone()
+    h = team_name(f, "home") or "Đội nhà"
+    a = team_name(f, "away") or "Đội khách"
+    fixture_labels.append(f"{dt:%d/%m %H:%M} — {h} vs {a}")
+
+fidx = st.selectbox("⚽ Chọn trận TƯƠNG LAI", range(len(fixtures)), format_func=lambda i: fixture_labels[i])
+selected = fixtures[fidx]
+
+st.write(f"**{team_name(selected, 'home')}**  vs  **{team_name(selected, 'away')}**")
+
+if st.button("🤖 Phân tích AI đa kèo", type="primary", use_container_width=True):
+    with st.spinner("Đang thu thập dữ liệu và chạy ensemble model..."):
+        try:
+            fid = fixture_id(selected)
+            detail = fixture_detail(fid) if fid else selected
+            fx = detail.get("fixture", detail) if isinstance(detail, dict) else {}
+            home_id = team_id_from_fixture(fx, "home") or team_id_from_fixture(selected, "home")
+            away_id = team_id_from_fixture(fx, "away") or team_id_from_fixture(selected, "away")
+            if home_id is None or away_id is None:
+                st.error("API chưa trả về ID của hai đội trong trận này.")
+                st.stop()
+
+            home_name = team_name(fx, "home") or team_name(selected, "home")
+            away_name = team_name(fx, "away") or team_name(selected, "away")
+            hf = team_form(home_id, home_name)
+            af = team_form(away_id, away_name)
+            sfh = standings_form(selected_league["id"], home_id, home_name)
+            sfa = standings_form(selected_league["id"], away_id, away_name)
+            h2h = h2h_signal(h2h_detail(home_id, away_id), home_id, away_id)
+
+            if hf.get("n",0) < 5 or af.get("n",0) < 5:
+                st.warning("Chưa đủ tối thiểu 5 trận lịch sử cho một đội. App không tự bịa dữ liệu để ép ra dự đoán.")
+                st.stop()
+
+            lg = league_detail(selected_league["id"])
+            league_avg = league_goal_average(lg)
+            lam_home, lam_away = safe_lambdas(hf, af, h2h, league_avg)
+            matrix = poisson_matrix(lam_home, lam_away)
+            p1x2 = probs_1x2(matrix)
+
+            # Small standings blend when available; keeps probabilities calibrated rather than replacing match data.
+            if sfh.get("n",0) and sfa.get("n",0):
+                sd = sfh["ppg"] - sfa["ppg"]
+                adj = float(np.clip(sd * 0.025, -0.06, 0.06))
+                p1x2["1"] += adj
+                p1x2["2"] -= adj
+                p1x2["X"] = max(0.001, 1.0-p1x2["1"]-p1x2["2"])
+                total=sum(p1x2.values()); p1x2={k:v/total for k,v in p1x2.items()}
+
+            best=max(p1x2,key=p1x2.get)
+            names={"1":"Chủ nhà thắng","X":"Hòa","2":"Đội khách thắng"}
+
+            st.subheader("🎯 1X2")
+            c1,c2,c3=st.columns(3)
+            c1.metric("1 — Chủ nhà",f"{p1x2['1']*100:.1f}%")
+            c2.metric("X — Hòa",f"{p1x2['X']*100:.1f}%")
+            c3.metric("2 — Đội khách",f"{p1x2['2']*100:.1f}%")
+            st.success(f"Kết quả có xác suất cao nhất: **{best} — {names[best]}**")
+
+            st.subheader("⚽ Over / Under")
+            cols=st.columns(4)
+            for col,line in zip(cols,[1.5,2.5,3.5,4.5]):
+                pu=over_under(matrix,line)
+                col.metric(f"O {line}",f"{pu['Over']*100:.1f}%")
+                col.caption(f"U {line}: {pu['Under']*100:.1f}%")
+
+            st.subheader("🥅 BTTS")
+            b=btts_probs(matrix)
+            c1,c2=st.columns(2)
+            c1.metric("BTTS — Có",f"{b['Có']*100:.1f}%")
+            c2.metric("BTTS — Không",f"{b['Không']*100:.1f}%")
+
+            st.subheader("🔢 Tỷ số có xác suất cao")
+            score_rows=top_scores(matrix,5)
+            df=pd.DataFrame([{
+                "Tỷ số":f"{i}-{j}",
+                "Xác suất":f"{p*100:.1f}%"
+            } for p,i,j in score_rows])
+            st.dataframe(df,use_container_width=True,hide_index=True)
+
+            st.subheader("🔁 Double Chance")
+            dc={
+                "1X":p1x2["1"]+p1x2["X"],
+                "X2":p1x2["X"]+p1x2["2"],
+                "12":p1x2["1"]+p1x2["2"],
+            }
+            cols=st.columns(3)
+            for col,k in zip(cols,["1X","X2","12"]): col.metric(k,f"{dc[k]*100:.1f}%")
+
+            st.divider()
+            st.caption(
+                f"Data Engine: tối đa {hf['n']} trận gần nhất chủ nhà + {af['n']} trận gần nhất đội khách, "
+                f"trọng số trận mới cao hơn; standings={sfh.get('n',0)}/{sfa.get('n',0)}; H2H={h2h.get('n',0)}; "
+                f"league goal avg={league_avg:.2f}. λ={lam_home:.2f}/{lam_away:.2f}."
             )
-            st.stop()
-        rows = build_rows(events, odds_format)
-        if not rows:
-            st.warning("Có sự kiện nhưng chưa có odds phù hợp ở các thị trường đã chọn.")
-            st.stop()
-        df = pd.DataFrame(rows)
-        df["start_display"] = pd.to_datetime(df["start"], errors="coerce", utc=True).dt.strftime("%d/%m/%Y %H:%M UTC")
-        df["edge_pp"] = pd.to_numeric(df["edge_pp"], errors="coerce")
-        df["market_fair_prob"] = pd.to_numeric(df["market_fair_prob"], errors="coerce")
-        # Deduplicate to best price per event/market/selection/line, keeping all source context.
-        dedup_keys = ["event_id", "market_key", "selection", "description", "point"]
-        best_rows = df.sort_values("decimal", ascending=False).drop_duplicates(dedup_keys, keep="first").copy()
-        best_rows["prob_pct"] = best_rows["market_fair_prob"] * 100
-        best_rows["best_odds"] = best_rows["best_decimal"]
-        best_rows["edge_label"] = best_rows["edge_pp"].map(lambda x: f"{x:+.2f} pp" if pd.notna(x) else "—")
-        st.success(f"Đã tải {len(events)} sự kiện; tạo {len(best_rows)} lựa chọn có odds.")
-        if quota:
-            st.caption("Thông tin hạn mức API: " + " · ".join(f"{k}: {v}" for k, v in quota.items()))
-
-        f1, f2 = st.columns(2)
-        with f1:
-            search = st.text_input("Tìm đội / người chơi / sự kiện", "")
-        with f2:
-            market_filter = st.multiselect(
-                "Lọc thị trường",
-                sorted(best_rows["market_key"].dropna().unique().tolist()),
-                default=sorted(best_rows["market_key"].dropna().unique().tolist()),
-            )
-        filtered = best_rows.copy()
-        if search.strip():
-            filtered = filtered[filtered["event"].str.contains(search.strip(), case=False, na=False)]
-        if market_filter:
-            filtered = filtered[filtered["market_key"].isin(market_filter)]
-        elif not market_filter:
-            filtered = filtered.iloc[0:0]
-
-        # Display best price and fair market estimate; do not imply independent prediction.
-        display_cols = {
-            "start_display": "Bắt đầu",
-            "event": "Sự kiện",
-            "market_key": "Market",
-            "selection": "Lựa chọn",
-            "description": "VĐV/đội (nếu có)",
-            "point": "Line",
-            "best_book": "Nhà cái tốt nhất",
-            "best_odds": "Odds tốt nhất",
-            "prob_pct": "Xác suất thị trường (%)",
-            "edge_label": "Chênh lệch giá so với fair market",
-        }
-        st.subheader("Bảng phân tích")
-        st.caption("Xác suất thị trường là trung bình các xác suất đã loại biên ở các nhà cái có dữ liệu tương ứng. Không phải xác suất độc lập.")
-        st.dataframe(
-            filtered[list(display_cols)].rename(columns=display_cols),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        shortlist = filtered[filtered["edge_pp"] >= min_edge].sort_values("edge_pp", ascending=False)
-        st.subheader(f"Sàng lọc chênh lệch giá ≥ {min_edge} điểm phần trăm")
-        if shortlist.empty:
-            st.info("Chưa có lựa chọn đạt ngưỡng. Không ép ra kèo khi dữ liệu không đủ.")
-        else:
-            st.dataframe(
-                shortlist[list(display_cols)].rename(columns=display_cols),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.caption("Chênh lệch có thể phản ánh khác biệt giữa nhà cái, thời điểm cập nhật hoặc cách định nghĩa market; cần kiểm tra thủ công trước khi ra quyết định.")
-
-        csv = filtered.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Tải bảng phân tích CSV", csv, file_name="odds_analysis.csv", mime="text/csv")
-        st.caption("Dữ liệu odds có thể thay đổi nhanh. Kiểm tra thời điểm cập nhật và luật thanh toán của nhà cái.")
-    except Exception as e:
-        st.error(str(e))
-        st.markdown(
-            "**Nếu lỗi API key:** kiểm tra `THE_ODDS_API_KEY` trong Streamlit Secrets. "
-            "Nếu lỗi quyền truy cập, gói hiện tại có thể không hỗ trợ môn/market đã chọn. "
-            "Không gửi key bí mật cho người khác."
-        )
-
-with st.expander("Các giới hạn quan trọng"):
-    st.markdown(
-        "- Danh mục hiển thị phụ thuộc hoàn toàn vào những môn mà API key/gói dịch vụ cho phép.\n"
-        "- Gói miễn phí có thể chỉ hỗ trợ một số môn và market cơ bản; esports có thể cần gói riêng/cao hơn.\n"
-        "- Ứng dụng hiện quét odds và tính xác suất ngầm định từ thị trường; không tuyên bố đây là mô hình dự đoán độc lập cho mọi môn.\n"
-        "- Muốn mô hình độc lập cho từng môn (bóng đá, tennis, bóng rổ, CS2, LoL, Dota 2...), cần dữ liệu lịch sử phù hợp, đặc trưng riêng và backtest theo từng môn/market.\n"
-        "- Không có hệ thống nào bảo đảm thắng hoặc có lợi nhuận."
-    )
+            st.info("Đây là xác suất mô hình, không phải tỷ lệ cược nhà cái và không đảm bảo kết quả. Các thị trường như góc/thẻ chỉ nên thêm khi có đủ dữ liệu lịch sử tương ứng.")
+        except Exception as e:
+            st.error(f"Không thể phân tích trận này: {e}")
