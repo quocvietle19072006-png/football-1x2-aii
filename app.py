@@ -1,254 +1,415 @@
 import math
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Sports Match Analyzer", page_icon="🎯", layout="wide")
-BASE = "https://api.the-odds-api.com/v4"
-API_KEY = st.secrets.get("THE_ODDS_API_KEY", "")
+st.set_page_config(page_title="Multi-Sport Bet Analyzer", page_icon="🎯", layout="wide")
+ODDS_BASE = "https://api.the-odds-api.com/v4"
+FOOTBALL_BASE = "https://v3.football.api-sports.io"
+ODDS_KEY = st.secrets.get("THE_ODDS_API_KEY", "")
+FOOTBALL_KEY = st.secrets.get("API_FOOTBALL_KEY", st.secrets.get("APISPORTS_KEY", ""))
 
-st.title("🎯 Sports Match Analyzer")
-st.caption("Phân tích odds trước trận • Ước tính xác suất tham chiếu • Sàng lọc chênh lệch giá")
+st.title("🎯 Multi-Sport Bet Analyzer")
+st.caption("Sàng lọc kèo trước trận • Xếp hạng lựa chọn • Tách rõ mô hình thống kê và tham chiếu thị trường")
 
-if not API_KEY:
-    st.error("Chưa tìm thấy THE_ODDS_API_KEY trong Streamlit Secrets.")
+if not ODDS_KEY:
+    st.error("Thiếu THE_ODDS_API_KEY trong Streamlit Secrets.")
     st.code('THE_ODDS_API_KEY = "YOUR_KEY_HERE"', language="toml")
     st.stop()
 
 session = requests.Session()
+session.headers.update({"User-Agent": "MultiSportBetAnalyzer/2.0"})
 
 
-def api(path, params=None):
-    query = dict(params or {})
-    query["apiKey"] = API_KEY
+def get_odds(path, params=None):
+    p = dict(params or {})
+    p["apiKey"] = ODDS_KEY
     try:
-        response = session.get(BASE + path, params=query, timeout=20)
-        if response.status_code == 401:
-            return {"_error": "API key không hợp lệ hoặc chưa được kích hoạt."}, {}
-        if response.status_code == 429:
-            return {"_error": "Đã hết hạn mức requests của gói API."}, {}
-        if response.status_code == 422:
-            return {"_error": "API không hỗ trợ môn/thị trường/khu vực này trong gói hiện tại."}, {}
-        response.raise_for_status()
-        meta = {"remaining": response.headers.get("x-requests-remaining"), "used": response.headers.get("x-requests-used")}
-        return response.json(), meta
-    except requests.RequestException as exc:
-        return {"_error": f"Không kết nối được API: {exc}"}, {}
+        r = session.get(ODDS_BASE + path, params=p, timeout=25)
+        if r.status_code == 401:
+            return {"_error": "API key The Odds API không hợp lệ."}, {}
+        if r.status_code == 429:
+            return {"_error": "Đã hết hạn mức The Odds API."}, {}
+        if r.status_code == 422:
+            return {"_error": "Môn/kèo/khu vực này không được gói API hỗ trợ."}, {}
+        r.raise_for_status()
+        return r.json(), {
+            "remaining": r.headers.get("x-requests-remaining"),
+            "used": r.headers.get("x-requests-used"),
+            "last": r.headers.get("x-requests-last"),
+        }
+    except requests.RequestException as e:
+        return {"_error": f"Lỗi kết nối The Odds API: {e}"}, {}
     except ValueError:
-        return {"_error": "API trả về dữ liệu không hợp lệ."}, {}
+        return {"_error": "The Odds API trả về dữ liệu không hợp lệ."}, {}
 
 
-def parse_time(value):
+def get_football(path, params=None):
+    if not FOOTBALL_KEY:
+        return None, "Chưa cấu hình API_FOOTBALL_KEY (tùy chọn)."
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        r = session.get(
+            FOOTBALL_BASE + path,
+            params=params or {},
+            headers={"x-apisports-key": FOOTBALL_KEY},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("errors"):
+            return None, f"API-Football báo lỗi: {data['errors']}"
+        return data.get("response", []), None
+    except requests.RequestException as e:
+        return None, f"Không lấy được dữ liệu API-Football: {e}"
+    except ValueError:
+        return None, "API-Football trả về dữ liệu không hợp lệ."
+
+
+def dt_parse(v):
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
 
 
-def fmt_time(value):
-    dt = parse_time(value)
-    return dt.astimezone().strftime("%d/%m/%Y %H:%M %Z") if dt else str(value or "Chưa có giờ")
+def local_time(v):
+    d = dt_parse(v)
+    return d.astimezone().strftime("%d/%m %H:%M %Z") if d else str(v or "Chưa rõ giờ")
 
 
-def safe_float(value):
+def number(v):
     try:
-        result = float(value)
-        return result if math.isfinite(result) else None
+        x = float(v)
+        return x if math.isfinite(x) else None
     except (TypeError, ValueError):
         return None
 
 
-def line_label(market_key, name, point):
-    if point is None:
-        return str(name)
-    if market_key == "totals":
-        return f"{name} {point:g}"
-    return f"{name} ({point:+g})"
+def market_label(key):
+    return {
+        "h2h": "Thắng trận / 1X2",
+        "h2h_3_way": "1X2 có hòa",
+        "spreads": "Chấp điểm / handicap",
+        "totals": "Tài / Xỉu",
+        "btts": "Hai đội ghi bàn (BTTS)",
+        "draw_no_bet": "Hòa được hoàn tiền (DNB)",
+        "team_totals": "Tổng điểm/bàn của đội",
+        "alternate_spreads": "Handicap thay thế",
+        "alternate_totals": "Tài/Xỉu thay thế",
+        "outrights": "Vô địch / outright",
+    }.get(key, key)
 
 
-def analyze_market(bookmakers, market_key):
-    """Compare exact market lines; probability is market consensus, not an independent model."""
+def outcome_label(market_key, outcome):
+    name = str(outcome.get("name") or "Lựa chọn")
+    desc = outcome.get("description")
+    point = number(outcome.get("point"))
+    if desc:
+        name = f"{desc}: {name}"
+    if point is not None:
+        if market_key in ("totals", "alternate_totals", "team_totals"):
+            name = f"{name} {point:g}"
+        else:
+            name = f"{name} ({point:+g})"
+    return name
+
+
+def build_rows(bookmakers, market_key):
+    """Vig-removed per-book probabilities, exact-line consensus, best available price."""
     grouped = {}
     for book in bookmakers or []:
         book_name = book.get("title") or book.get("key") or "Nhà cái"
         for market in book.get("markets", []) or []:
             if market.get("key") != market_key:
                 continue
-            valid = []
-            for outcome in market.get("outcomes", []) or []:
-                price = safe_float(outcome.get("price"))
-                if price and price > 1:
-                    point = safe_float(outcome.get("point"))
-                    valid.append((outcome, price, point))
-            if len(valid) < 2:
+            outcomes = []
+            for out in market.get("outcomes", []) or []:
+                price = number(out.get("price"))
+                if price is not None and price > 1:
+                    point = number(out.get("point"))
+                    outcomes.append((out, price, point))
+            if len(outcomes) < 2:
                 continue
-            # A bookmaker's opposing spread sides use +x/-x; pair only matching absolute lines.
-            lines = {}
-            for outcome, price, point in valid:
-                line_id = abs(point) if market_key == "spreads" and point is not None else point
-                lines.setdefault(line_id, []).append((outcome, price, point))
-            for line_id, outcomes in lines.items():
-                if len(outcomes) < 2:
+            # Normalize only outcomes sharing the same line; spreads use absolute point for pairing.
+            by_line = {}
+            for out, price, point in outcomes:
+                if market_key in ("spreads", "alternate_spreads") and point is not None:
+                    line = abs(point)
+                else:
+                    line = point
+                by_line.setdefault(line, []).append((out, price, point))
+            for line, items in by_line.items():
+                if len(items) < 2:
                     continue
-                total = sum(1 / item[1] for item in outcomes)
+                total = sum(1 / item[1] for item in items)
                 if total <= 0:
                     continue
-                for outcome, price, point in outcomes:
-                    name = str(outcome.get("name") or "Không rõ")
-                    # Exact signed point prevents comparing different sides/lines across books.
-                    key = (name, point)
+                for out, price, point in items:
+                    name = outcome_label(market_key, out)
+                    # Preserve outcome name and point to prevent mixing opposing sides/lines.
+                    key = (name, number(point))
                     grouped.setdefault(key, []).append({
-                        "prob": (1 / price) / total,
+                        "p": (1 / price) / total,
                         "odds": price,
                         "book": book_name,
                         "updated": market.get("last_update"),
                     })
-
     rows = []
-    market_names = {"h2h": "Moneyline / 1X2", "spreads": "Handicap / Spread", "totals": "Tài / Xỉu"}
-    for (name, point), values in grouped.items():
-        # One quote per bookmaker per exact outcome/line.
+    for (name, point), vals in grouped.items():
         unique = {}
-        for v in values:
+        for v in vals:
             if v["book"] not in unique or v["odds"] > unique[v["book"]]["odds"]:
                 unique[v["book"]] = v
-        values = list(unique.values())
-        if not values:
+        vals = list(unique.values())
+        if not vals:
             continue
-        probs = [v["prob"] for v in values]
-        consensus = statistics.median(probs)
-        spread = statistics.pstdev(probs) if len(probs) > 1 else 0.0
-        best = max(values, key=lambda v: v["odds"])
-        fair = 1 / consensus if consensus > 0 else math.inf
-        edge = consensus * best["odds"] - 1
-        breakeven = 1 / best["odds"]
-        if len(values) < 3:
-            status = "⚪ Chưa đủ nguồn so sánh"
-        elif spread > 0.035:
-            status = "⚪ Odds lệch nhau — cần kiểm tra"
-        elif edge >= 0.05:
-            status = "🟡 Chênh lệch đáng kiểm tra"
-        elif edge >= 0.02:
-            status = "🟡 Chênh lệch nhỏ"
+        ps = [v["p"] for v in vals]
+        p_ref = statistics.median(ps)
+        dispersion = statistics.pstdev(ps) if len(ps) > 1 else 0.0
+        best = max(vals, key=lambda x: x["odds"])
+        edge = p_ref * best["odds"] - 1
+        p_be = 1 / best["odds"]
+        n = len(vals)
+        # Ranking is intentionally conservative and does not label market-derived estimates as independent.
+        confidence = "Thấp"
+        if n >= 5 and dispersion <= 0.02:
+            confidence = "Vừa (đồng thuận nhà cái)"
+        elif n >= 3 and dispersion <= 0.035:
+            confidence = "Thấp–vừa (đồng thuận nhà cái)"
+        if n < 3:
+            reason = "Ít nguồn odds để đối chiếu"
+        elif dispersion > 0.035:
+            reason = "Nhà cái bất đồng đáng kể"
+        elif edge >= 0.03:
+            reason = "Giá tốt hơn tham chiếu thị trường; cần xác minh kèo/đường kèo"
         else:
-            status = "⛔ Chưa thấy chênh lệch thuận lợi"
+            reason = "Chưa có chênh lệch giá rõ ràng"
         rows.append({
             "market_key": market_key,
-            "Market": market_names.get(market_key, market_key),
-            "Lựa chọn": line_label(market_key, name, point),
-            "Điểm kèo": point,
-            "Xác suất tham chiếu thị trường": consensus,
-            "Xác suất hòa vốn theo odds": breakeven,
-            "Odds tốt nhất": best["odds"],
-            "Fair odds tham chiếu": fair,
-            "Chênh lệch giá ước tính": edge,
-            "Độ phân tán": spread,
-            "Số nhà cái": len(values),
-            "Nhà cái tốt nhất": best["book"],
-            "Cập nhật gần nhất": best.get("updated"),
-            "Kết luận": status,
+            "market": market_label(market_key),
+            "selection": name,
+            "point": point,
+            "p_market": p_ref,
+            "p_be": p_be,
+            "best_odds": best["odds"],
+            "fair_odds": 1 / p_ref if p_ref > 0 else math.inf,
+            "edge": edge,
+            "dispersion": dispersion,
+            "books": n,
+            "best_book": best["book"],
+            "updated": best.get("updated"),
+            "confidence": confidence,
+            "reason": reason,
         })
     return rows
 
 
-sports, _ = api("/sports", {"all": "true"})
-if isinstance(sports, dict) and sports.get("_error"):
-    st.error(sports["_error"])
+def team_match_score(a, b):
+    a, b = (a or "").lower(), (b or "").lower()
+    return max(SequenceMatcher(None, a, b).ratio(), SequenceMatcher(None, a.replace("fc", "").strip(), b.replace("fc", "").strip()).ratio())
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def football_prediction_for_match(home, away, kickoff_iso):
+    """Optional independent-ish football input from API-Football's form/H2H model."""
+    kickoff = dt_parse(kickoff_iso)
+    if kickoff is None:
+        return None, "Không đọc được thời gian trận."
+    fixtures, err = get_football("/fixtures", {"date": kickoff.strftime("%Y-%m-%d"), "timezone": "UTC"})
+    if err:
+        return None, err
+    best, best_score = None, 0.0
+    for f in fixtures or []:
+        teams = f.get("teams", {})
+        h = teams.get("home", {}).get("name", "")
+        a = teams.get("away", {}).get("name", "")
+        score = (team_match_score(home, h) + team_match_score(away, a)) / 2
+        if score > best_score:
+            best, best_score = f, score
+    if not best or best_score < 0.68:
+        return None, "Không ghép được trận tương ứng đủ tin cậy giữa hai nguồn dữ liệu."
+    fixture_id = best.get("fixture", {}).get("id")
+    predictions, err = get_football("/predictions", {"fixture": fixture_id})
+    if err or not predictions:
+        return None, err or "API-Football chưa có dự đoán cho trận này."
+    p = predictions[0].get("predictions", {})
+    percent = p.get("percent", {})
+    def pct(key):
+        raw = str(percent.get(key, "")).replace("%", "").strip()
+        v = number(raw)
+        return v / 100 if v is not None else None
+    probs = {"home": pct("home"), "draw": pct("draw"), "away": pct("away")}
+    if any(v is None for v in probs.values()) or sum(probs.values()) <= 0:
+        return None, "API-Football không trả đủ phần trăm xác suất."
+    total = sum(probs.values())
+    probs = {k: v / total for k, v in probs.items()}
+    return {
+        "home": best.get("teams", {}).get("home", {}).get("name", home),
+        "away": best.get("teams", {}).get("away", {}).get("name", away),
+        "probs": probs,
+        "winner": p.get("winner", {}).get("name", "Chưa rõ"),
+        "advice": p.get("advice", ""),
+        "goals": p.get("goals", {}),
+        "match_score": best_score,
+    }, None
+
+
+sports_data, _ = get_odds("/sports", {"all": "true"})
+if isinstance(sports_data, dict) and sports_data.get("_error"):
+    st.error(sports_data["_error"])
     st.stop()
-if not isinstance(sports, list) or not sports:
-    st.warning("API không trả về danh sách môn/giải khả dụng.")
+if not isinstance(sports_data, list) or not sports_data:
+    st.error("Không lấy được danh sách môn thể thao.")
     st.stop()
 
-active_sports = [x for x in sports if x.get("active", True)] or sports
-labels = [f"{x.get('title', x.get('key', 'Môn'))} ({x.get('key', '')})" for x in active_sports]
-sport = active_sports[st.selectbox("1. Chọn môn / giải", range(len(active_sports)), format_func=lambda i: labels[i])]
-sport_key = sport.get("key")
+active = [s for s in sports_data if s.get("active", True)] or sports_data
+labels = [f"{s.get('title', s.get('key', 'Môn'))} — {s.get('key', '')}" for s in active]
+sport = active[st.selectbox("1. Chọn môn/giải", range(len(active)), format_func=lambda i: labels[i])]
+sport_key = sport.get("key", "")
+is_soccer = str(sport_key).startswith("soccer_")
 
-c1, c2 = st.columns(2)
-with c1:
-    region = st.selectbox("Khu vực nhà cái", ["us", "uk", "eu", "au"], index=0)
-with c2:
-    markets = st.multiselect("Thị trường muốn phân tích", ["h2h", "spreads", "totals"], default=["h2h", "spreads", "totals"], format_func=lambda x: {"h2h":"Moneyline / 1X2", "spreads":"Handicap / Spread", "totals":"Tài / Xỉu"}[x])
-
-st.info("Lưu ý quan trọng: The Odds API cung cấp lịch và odds, không tự cung cấp đầy đủ phong độ/thống kê để tạo mô hình độc lập cho mọi môn. Vì vậy xác suất dưới đây là xác suất tham chiếu suy ra từ odds đã loại biên, không được gọi là dự đoán AI độc lập.")
-if not markets:
-    st.warning("Hãy chọn ít nhất một thị trường.")
+regions = st.multiselect("Khu vực nhà cái", ["eu", "uk", "us", "au"], default=["eu", "uk"] if is_soccer else ["us"])
+if not regions:
+    st.warning("Chọn ít nhất một khu vực nhà cái.")
     st.stop()
 
-if st.button("🔍 Phân tích các trận trước giờ thi đấu", type="primary", use_container_width=True):
+base_markets = ["h2h", "spreads", "totals"]
+if is_soccer:
+    base_markets += ["h2h_3_way", "btts", "draw_no_bet", "team_totals"]
+with st.expander("Thị trường bổ sung (chỉ có khi API và nhà cái hỗ trợ)"):
+    extra_markets = st.multiselect(
+        "Chọn thêm thị trường",
+        ["alternate_spreads", "alternate_totals", "outrights"],
+        default=[],
+        format_func=market_label,
+    )
+markets = st.multiselect(
+    "2. Thị trường phân tích",
+    list(dict.fromkeys(base_markets + extra_markets)),
+    default=["h2h"] + (["totals", "spreads"] if not is_soccer else ["h2h_3_way", "totals", "spreads", "btts"]),
+    format_func=market_label,
+)
+st.caption("App chỉ hiện các thị trường có dữ liệu trả về. Phạm vi thực tế tùy gói The Odds API, giải đấu, khu vực và thời điểm.")
+
+if st.button("🔍 Quét trận sắp diễn ra", type="primary", use_container_width=True):
     st.session_state["scan_requested"] = True
-
-with st.spinner("Đang lấy lịch và odds từ The Odds API..."):
-    events_data, meta = api(f"/sports/{sport_key}/odds", {"regions": region, "markets": ",".join(markets), "oddsFormat": "decimal", "dateFormat": "iso"})
-if isinstance(events_data, dict) and events_data.get("_error"):
-    st.error(events_data["_error"])
-    st.info("Thử chọn ít market hơn, đổi khu vực nhà cái hoặc chọn môn/giải khác. Phạm vi dữ liệu phụ thuộc gói API.")
+if not markets:
+    st.warning("Chọn ít nhất một thị trường.")
     st.stop()
-if not isinstance(events_data, list):
-    st.warning("Dữ liệu sự kiện không hợp lệ.")
+
+with st.spinner("Đang lấy lịch và odds..."):
+    events, meta = get_odds(
+        f"/sports/{sport_key}/odds",
+        {"regions": ",".join(regions), "markets": ",".join(markets),
+         "oddsFormat": "decimal", "dateFormat": "iso"},
+    )
+if isinstance(events, dict) and events.get("_error"):
+    st.error(events["_error"])
+    st.info("Thử giảm số thị trường/khu vực hoặc chọn môn khác. Không phải gói API nào cũng hỗ trợ mọi thị trường.")
+    st.stop()
+if not isinstance(events, list):
+    st.error("Dữ liệu trận đấu không hợp lệ.")
     st.stop()
 
 now = datetime.now(timezone.utc)
-upcoming = [e for e in events_data if parse_time(e.get("commence_time")) and parse_time(e.get("commence_time")) > now]
-st.caption(f"Sự kiện trước trận: {len(upcoming)} • Requests còn lại: {meta.get('remaining', 'API không cung cấp')}")
+upcoming = [e for e in events if dt_parse(e.get("commence_time")) and dt_parse(e.get("commence_time")) > now]
+upcoming.sort(key=lambda e: dt_parse(e.get("commence_time")))
+st.caption(f"Trận chưa bắt đầu: {len(upcoming)} · API requests còn: {meta.get('remaining', 'không có thông tin')}")
 if not upcoming:
-    st.warning("API hiện không trả về trận sắp diễn ra cho lựa chọn này.")
+    st.warning("Không có trận sắp diễn ra cho lựa chọn này. Hãy đổi giải hoặc thử lại sau.")
     st.stop()
 
-upcoming.sort(key=lambda e: parse_time(e.get("commence_time")))
-def event_label(e):
-    return f"{e.get('home_team', 'Đội A')} vs {e.get('away_team', 'Đội B')} — {fmt_time(e.get('commence_time'))}"
-idx = st.selectbox("2. Chọn trận đấu", range(len(upcoming)), format_func=lambda i: event_label(upcoming[i]))
-event = upcoming[idx]
-st.subheader(event_label(event))
+def event_title(e):
+    return f"{e.get('home_team', 'Đội A')} vs {e.get('away_team', 'Đội B')} · {local_time(e.get('commence_time'))}"
+
+event_idx = st.selectbox("3. Chọn trận", range(len(upcoming)), format_func=lambda i: event_title(upcoming[i]))
+event = upcoming[event_idx]
+st.subheader(event_title(event))
 
 rows = []
-for market_key in markets:
-    rows.extend(analyze_market(event.get("bookmakers", []), market_key))
+for m in markets:
+    rows.extend(build_rows(event.get("bookmakers", []), m))
 if not rows:
-    st.warning("Chưa có đủ odds hợp lệ cho market đã chọn ở trận này.")
+    st.warning("Trận này chưa có đủ odds cho thị trường đã chọn.")
     st.stop()
 
-rows.sort(key=lambda r: r["Chênh lệch giá ước tính"], reverse=True)
-shortlist = [r for r in rows if r["Số nhà cái"] >= 3 and r["Độ phân tán"] <= 0.035 and r["Chênh lệch giá ước tính"] >= 0.02]
-st.subheader("🏆 Các lựa chọn đáng kiểm tra nhất")
+# Rank market-price candidates, but do not conflate this with a true predictive model.
+rows.sort(key=lambda r: (r["edge"], r["books"], -r["dispersion"]), reverse=True)
+shortlist = [
+    r for r in rows
+    if r["books"] >= 3 and r["dispersion"] <= 0.035 and r["edge"] >= 0.02
+]
+st.subheader("🏅 Xếp hạng kèo đáng kiểm tra")
+st.info("Thứ hạng mặc định dựa trên giá tốt so với xác suất tham chiếu từ odds đã loại biên. Đây chưa phải mô hình xác suất độc lập cho mọi môn.")
 if shortlist:
-    for i, r in enumerate(shortlist[:3], start=1):
+    for rank, r in enumerate(shortlist[:5], 1):
         with st.container(border=True):
-            st.markdown(f"### #{i} · {r['Lựa chọn']}")
-            st.caption(f"{r['Market']} · {r['Kết luận']}")
-            a, b, c = st.columns(3)
-            a.metric("Odds tốt nhất", f"{r['Odds tốt nhất']:.3f}")
-            b.metric("Xác suất tham chiếu", f"{r['Xác suất tham chiếu thị trường']*100:.1f}%")
-            c.metric("Chênh lệch giá", f"{r['Chênh lệch giá ước tính']*100:+.1f}%")
-            st.write(f"**Fair odds tham chiếu:** {r['Fair odds tham chiếu']:.3f} · **Hòa vốn cần:** {r['Xác suất hòa vốn theo odds']*100:.1f}%")
-            st.write(f"**Odds tốt nhất tại:** {r['Nhà cái tốt nhất']} · **Nguồn so sánh:** {r['Số nhà cái']} · **Độ phân tán:** {r['Độ phân tán']*100:.2f}%")
-            st.caption("Đây là chênh lệch so với thị trường tham chiếu, không phải bằng chứng chắc chắn về lợi nhuận. Hãy xác minh đúng handicap/tổng và odds còn hiệu lực.")
+            st.markdown(f"### #{rank} · {r['selection']}")
+            st.caption(f"{r['market']} · Mức tin cậy dữ liệu: {r['confidence']}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Odds tốt nhất", f"{r['best_odds']:.2f}")
+            c2.metric("Xác suất tham chiếu", f"{r['p_market']*100:.1f}%")
+            c3.metric("Chênh lệch giá", f"{r['edge']*100:+.1f}%")
+            st.write(f"**Fair odds:** {r['fair_odds']:.2f} · **Xác suất hòa vốn:** {r['p_be']*100:.1f}%")
+            st.write(f"**Nhà cái tốt nhất:** {r['best_book']} · **Nguồn so sánh:** {r['books']} · **Độ phân tán:** {r['dispersion']*100:.2f}%")
+            st.write(f"**Lý do:** {r['reason']}.")
 else:
-    st.info("Chưa có lựa chọn nào vượt tiêu chí sàng lọc. App sẽ không tự chọn kèo khi dữ liệu chưa đủ.")
+    st.warning("Chưa có kèo vượt bộ lọc. Không có đề xuất cược khi dữ liệu/giá chưa đủ thuyết phục.")
 
-st.subheader("📋 Bảng phân tích đầy đủ")
+if is_soccer and FOOTBALL_KEY:
+    st.subheader("⚽ Kiểm tra dự đoán bóng đá từ dữ liệu phong độ")
+    with st.spinner("Đang truy vấn API-Football để lấy dự đoán dựa trên phong độ/lịch sử..."):
+        fp, ferr = football_prediction_for_match(
+            event.get("home_team", ""), event.get("away_team", ""), event.get("commence_time", "")
+        )
+    if ferr:
+        st.warning(f"Chưa có dự đoán thống kê riêng: {ferr}")
+    else:
+        st.caption("Nguồn mô hình ngoài: API-Football Predictions (dựa trên các đầu vào thống kê của nhà cung cấp; không phải mô hình do app tự huấn luyện).")
+        p = fp["probs"]
+        a, b, c = st.columns(3)
+        a.metric(f"{fp['home']} thắng", f"{p['home']*100:.1f}%")
+        b.metric("Hòa", f"{p['draw']*100:.1f}%")
+        c.metric(f"{fp['away']} thắng", f"{p['away']*100:.1f}%")
+        st.write(f"**Đội được nhà cung cấp nghiêng về:** {fp['winner']}")
+        if fp.get("advice"):
+            st.write(f"**Nhận định nhà cung cấp:** {fp['advice']}")
+        if fp.get("goals"):
+            st.write(f"**Dự đoán bàn thắng:** {fp['goals']}")
+        st.caption(f"Độ khớp tên trận giữa hai nguồn: {fp['match_score']*100:.0f}%. Hãy xác nhận đúng trận trước khi tham khảo.")
+
+st.subheader("📊 Tất cả lựa chọn")
 display = []
 for r in rows:
     display.append({
-        "Market": r["Market"], "Lựa chọn / đường kèo": r["Lựa chọn"],
-        "Xác suất tham chiếu": f"{r['Xác suất tham chiếu thị trường']*100:.1f}%",
-        "Xác suất hòa vốn": f"{r['Xác suất hòa vốn theo odds']*100:.1f}%",
-        "Odds tốt nhất": round(r["Odds tốt nhất"], 3),
-        "Fair odds tham chiếu": round(r["Fair odds tham chiếu"], 3),
-        "Chênh lệch giá": f"{r['Chênh lệch giá ước tính']*100:+.1f}%",
-        "Nhà cái tốt nhất": r["Nhà cái tốt nhất"], "Số nhà cái": r["Số nhà cái"],
-        "Độ phân tán": f"{r['Độ phân tán']*100:.2f}%", "Kết luận": r["Kết luận"],
+        "Thị trường": r["market"],
+        "Lựa chọn": r["selection"],
+        "Xác suất tham chiếu": f"{r['p_market']*100:.1f}%",
+        "Hòa vốn": f"{r['p_be']*100:.1f}%",
+        "Odds tốt nhất": round(r["best_odds"], 3),
+        "Fair odds": round(r["fair_odds"], 3),
+        "Chênh lệch giá": f"{r['edge']*100:+.1f}%",
+        "Số nhà cái": r["books"],
+        "Độ phân tán": f"{r['dispersion']*100:.2f}%",
+        "Tin cậy dữ liệu": r["confidence"],
+        "Nhà cái tốt nhất": r["best_book"],
     })
 st.dataframe(display, use_container_width=True, hide_index=True)
-with st.expander("Cách đọc và giới hạn của phân tích"):
+
+with st.expander("Mô hình, độ tin cậy và giới hạn"):
     st.markdown("""
-- **Xác suất tham chiếu:** trung vị xác suất của các nhà cái sau khi loại biên trong từng bảng odds.
-- **Xác suất hòa vốn:** `1 / odds`; đây là tỷ lệ thắng cần có để hòa vốn trước các điều kiện khác.
-- **Chênh lệch giá ước tính:** `xác suất tham chiếu × odds tốt nhất − 1`. Đây chỉ là bộ lọc thị trường, không phải xác suất dự đoán độc lập.
-- **Độ phân tán:** mức bất đồng giữa xác suất tham chiếu của các nhà cái; thấp không có nghĩa chắc thắng.
-- App tách handicap và tổng điểm theo đường kèo để hạn chế so sánh nhầm.
-- Để có mô hình dự đoán độc lập thực sự cần dữ liệu lịch sử/phong độ/chỉ số chuyên biệt theo từng môn và kiểm định bằng kết quả quá khứ. Không thể suy ra các dữ liệu đó chỉ từ odds hiện tại.
+**1. Xác suất thị trường:** Với từng nhà cái, app loại biên bằng cách chuẩn hóa nghịch đảo odds trong cùng thị trường/đường kèo; sau đó lấy trung vị giữa các nhà cái.
+
+**2. Chênh lệch giá:** `xác suất tham chiếu × odds tốt nhất − 1`. Đây là tín hiệu so sánh giá, không phải lợi nhuận đảm bảo. Giá trị dương có thể do khác biệt cập nhật, đường kèo không tương đương hoặc sai lệch dữ liệu.
+
+**3. Mức tin cậy:** Chỉ phản ánh số nguồn odds và mức đồng thuận giữa nhà cái; không phải xác suất thắng.
+
+**4. Dự đoán thống kê riêng:** Nếu có `API_FOOTBALL_KEY` trong Streamlit Secrets, app thử lấy dự đoán 1X2 từ API-Football cho bóng đá. Nguồn này không tự động cung cấp mô hình riêng cho mọi môn thể thao và mọi loại kèo.
+
+**5. Để huấn luyện mô hình độc lập đúng nghĩa:** cần dữ liệu lịch sử có kết quả thật, thống kê chuyên môn theo môn/giải, quy trình backtest theo thời gian và đánh giá calibration, Brier score/log-loss, ROI sau biên nhà cái. Không được gọi odds hiện tại là AI dự đoán độc lập.
+
+**6. Cược có rủi ro:** Không có kèo chắc thắng. Không tăng tiền để gỡ lỗ; chỉ dùng số tiền có thể mất.
 """)
