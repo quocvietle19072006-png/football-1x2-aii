@@ -357,6 +357,67 @@ def independent_football_model(home, away, kickoff_iso):
         "expected_total": h_lam + a_lam,
     }, None
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def tennis_historical_elo(player_a, player_b, tour="atp", years_back=5, surface="All"):
+    """Fetch public Jeff Sackmann match-result CSVs and compute Elo; network/cache dependent."""
+    import pandas as pd
+    current_year = datetime.now(timezone.utc).year
+    base = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master" if tour == "atp" else "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master"
+    ratings = {}
+    used = 0
+    files_found = 0
+    # Read chronologically, using only completed match results from available yearly datasets.
+    for year in range(current_year - years_back, current_year + 1):
+        url = f"{base}/{tour}_matches_{year}.csv" if tour == "atp" else f"{base}/wta_matches_{year}.csv"
+        try:
+            response = session.get(url, timeout=15)
+            if response.status_code != 200:
+                continue
+            df = pd.read_csv(StringIO(response.text))
+            files_found += 1
+        except Exception:
+            continue
+        required = {"winner_name", "loser_name"}
+        if not required.issubset(set(df.columns)):
+            continue
+        for _, row in df.iterrows():
+            surf = str(row.get("surface", "") or "")
+            if surface != "All" and surf.lower() != surface.lower():
+                continue
+            winner, loser = str(row.get("winner_name", "") or "").strip(), str(row.get("loser_name", "") or "").strip()
+            if not winner or not loser or winner == "nan" or loser == "nan":
+                continue
+            rw, rl = ratings.get(winner, 1500.0), ratings.get(loser, 1500.0)
+            expected = 1.0 / (1.0 + 10.0 ** ((rl - rw) / 400.0))
+            # Modest K factor: an Elo baseline, not a calibrated betting probability.
+            k = 32.0
+            ratings[winner] = rw + k * (1.0 - expected)
+            ratings[loser] = rl + k * (0.0 - (1.0 - expected))
+            used += 1
+    if files_found == 0:
+        return None, "Không truy cập được bộ dữ liệu lịch sử tennis công khai. Có thể mạng bị chặn hoặc nguồn dữ liệu tạm thời không khả dụng."
+    def find_player(name):
+        target = name.strip().lower()
+        exact = [p for p in ratings if p.lower() == target]
+        if exact:
+            return exact[0]
+        # Conservative fuzzy match, avoiding ambiguous short names.
+        candidates = sorted(
+            [(SequenceMatcher(None, target, p.lower()).ratio(), p) for p in ratings],
+            reverse=True
+        )
+        if candidates and candidates[0][0] >= 0.78 and (len(candidates) == 1 or candidates[0][0] - candidates[1][0] > 0.04):
+            return candidates[0][1]
+        return None
+    pa, pb = find_player(player_a), find_player(player_b)
+    if not pa or not pb:
+        return None, "Không khớp chắc chắn tên một hoặc cả hai tay vợt trong dữ liệu lịch sử. Hãy nhập tên theo dữ liệu hoặc dùng CSV."
+    ra, rb = ratings[pa], ratings[pb]
+    p = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+    return {"p_a": p, "p_b": 1-p, "elo_a": ra, "elo_b": rb, "n": used,
+            "player_a_matched": pa, "player_b_matched": pb, "files": files_found}, None
+
 def tennis_elo_from_csv(uploaded, player_a, player_b, surface=None):
     """CSV columns: winner, loser; optional surface. Computes Elo from historic match order."""
     try:
@@ -534,23 +595,40 @@ if is_soccer:
                 st.caption("Mô hình chưa thấy lợi thế giá ở lựa chọn này.")
 
 st.subheader("🎾 Mô hình Elo tennis từ dữ liệu lịch sử")
-st.write("Để dự đoán tennis độc lập, tải lên CSV kết quả lịch sử có cột `winner`, `loser` và tùy chọn `surface`. Không dùng odds làm đầu vào của Elo.")
-tennis_csv = st.file_uploader("CSV kết quả tennis lịch sử (tùy chọn)", type=["csv"])
-if tennis_csv is not None:
-    ta, tb = st.columns(2)
-    with ta:
-        player_a = st.text_input("Tên tay vợt A", value=event.get("home_team", ""))
-    with tb:
-        player_b = st.text_input("Tên tay vợt B", value=event.get("away_team", ""))
-    surface = st.selectbox("Mặt sân (nếu CSV có cột surface)", ["Tất cả", "Hard", "Clay", "Grass", "Carpet"])
-    if st.button("Tính Elo tennis độc lập", use_container_width=True):
-        elo_result, elo_error = tennis_elo_from_csv(tennis_csv, player_a.strip(), player_b.strip(), None if surface == "Tất cả" else surface)
-        if elo_error:
-            st.warning(elo_error)
-        else:
-            st.metric(f"{player_a} thắng theo Elo", f"{elo_result['p_a']*100:.1f}%")
-            st.metric(f"{player_b} thắng theo Elo", f"{elo_result['p_b']*100:.1f}%")
-            st.caption(f"Elo A: {elo_result['elo_a']:.0f}; Elo B: {elo_result['elo_b']:.0f}; số trận dùng: {elo_result['n']}. Mẫu tối thiểu không đảm bảo dữ liệu đủ đại diện.")
+st.write("Thử lấy kết quả lịch sử công khai tự động trước; nếu nguồn không khả dụng hoặc không khớp tên, bạn vẫn có thể tải CSV.")
+ta, tb = st.columns(2)
+with ta:
+    player_a = st.text_input("Tên tay vợt A", value=event.get("home_team", ""))
+with tb:
+    player_b = st.text_input("Tên tay vợt B", value=event.get("away_team", ""))
+tc1, tc2, tc3 = st.columns(3)
+with tc1:
+    tennis_tour = st.selectbox("Tour", ["wta", "atp"], index=0 if any(x in (event.get("home_team","")+event.get("away_team","")).lower() for x in ["mirra", "nikola", "iga", "coco"]) else 1)
+with tc2:
+    tennis_years = st.selectbox("Dữ liệu lịch sử", [3, 5, 8], index=1)
+with tc3:
+    tennis_surface = st.selectbox("Mặt sân", ["All", "Hard", "Clay", "Grass", "Carpet"])
+if st.button("Tính Elo tennis từ dữ liệu công khai", use_container_width=True):
+    with st.spinner("Đang tải dữ liệu lịch sử và tính Elo..."):
+        elo_result, elo_error = tennis_historical_elo(player_a.strip(), player_b.strip(), tennis_tour, tennis_years, tennis_surface)
+    if elo_error:
+        st.warning(elo_error)
+    else:
+        ec1, ec2 = st.columns(2)
+        ec1.metric(f"{elo_result['player_a_matched']} thắng theo Elo", f"{elo_result['p_a']*100:.1f}%")
+        ec2.metric(f"{elo_result['player_b_matched']} thắng theo Elo", f"{elo_result['p_b']*100:.1f}%")
+        st.caption(f"Elo A: {elo_result['elo_a']:.0f}; Elo B: {elo_result['elo_b']:.0f}; {elo_result['n']:,} trận dùng trong dữ liệu; {elo_result['files']} tệp năm tải được.")
+        st.warning("Đây là xác suất Elo cơ sở từ kết quả lịch sử, chưa được hiệu chuẩn/backtest theo giải đấu, mặt sân và chấn thương; không dùng đơn lẻ làm lệnh cược.")
+st.write("**Tùy chọn dự phòng: tải CSV của riêng bạn** (cột `winner`, `loser`, có thể thêm `surface`).")
+tennis_csv = st.file_uploader("CSV kết quả tennis lịch sử", type=["csv"])
+if tennis_csv is not None and st.button("Tính Elo từ CSV", use_container_width=True):
+    elo_result, elo_error = tennis_elo_from_csv(tennis_csv, player_a.strip(), player_b.strip(), None if tennis_surface == "All" else tennis_surface)
+    if elo_error:
+        st.warning(elo_error)
+    else:
+        st.metric(f"{player_a} thắng theo Elo CSV", f"{elo_result['p_a']*100:.1f}%")
+        st.metric(f"{player_b} thắng theo Elo CSV", f"{elo_result['p_b']*100:.1f}%")
+        st.caption(f"Elo A: {elo_result['elo_a']:.0f}; Elo B: {elo_result['elo_b']:.0f}; số trận dùng: {elo_result['n']}.")
 
 st.subheader("📊 Tất cả lựa chọn")
 display = []
