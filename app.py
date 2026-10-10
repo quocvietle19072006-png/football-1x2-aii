@@ -6,13 +6,13 @@ from difflib import SequenceMatcher
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Multi-Sport Bet Analyzer", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Independent Multi-Sport Bet Analyzer", page_icon="🎯", layout="wide")
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 FOOTBALL_BASE = "https://v3.football.api-sports.io"
 ODDS_KEY = st.secrets.get("THE_ODDS_API_KEY", "")
 FOOTBALL_KEY = st.secrets.get("API_FOOTBALL_KEY", st.secrets.get("APISPORTS_KEY", ""))
 
-st.title("🎯 Multi-Sport Bet Analyzer")
+st.title("🎯 Independent Multi-Sport Bet Analyzer")
 st.caption("Sàng lọc kèo trước trận • Xếp hạng lựa chọn • Tách rõ mô hình thống kê và tham chiếu thị trường")
 
 if not ODDS_KEY:
@@ -21,7 +21,7 @@ if not ODDS_KEY:
     st.stop()
 
 session = requests.Session()
-session.headers.update({"User-Agent": "MultiSportBetAnalyzer/2.0"})
+session.headers.update({"User-Agent": "IndependentMultiSportBetAnalyzer/3.0"})
 
 
 def get_odds(path, params=None):
@@ -257,6 +257,138 @@ def football_prediction_for_match(home, away, kickoff_iso):
     }, None
 
 
+
+
+# ---------------- Independent statistical models (v3) ----------------
+# Football: Poisson goal model built from recent completed API-Football fixtures.
+# Tennis: Elo model trained from a user-provided historical match CSV.
+import csv
+from io import StringIO
+
+def poisson_pmf(k, lam):
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+def poisson_1x2(home_lambda, away_lambda, max_goals=10):
+    ph = [poisson_pmf(i, home_lambda) for i in range(max_goals + 1)]
+    pa = [poisson_pmf(i, away_lambda) for i in range(max_goals + 1)]
+    home = draw = away = total = 0.0
+    for h, hp in enumerate(ph):
+        for a, ap in enumerate(pa):
+            p = hp * ap
+            total += p
+            if h > a: home += p
+            elif h == a: draw += p
+            else: away += p
+    if total:
+        return {"home": home / total, "draw": draw / total, "away": away / total}
+    return {"home": 1/3, "draw": 1/3, "away": 1/3}
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def team_id_search(team_name):
+    resp, err = get_football("/teams", {"search": team_name})
+    if err or not resp:
+        return None
+    # Prefer a close name match, but reject weak matches.
+    ranked = sorted(resp, key=lambda x: team_match_score(team_name, x.get("team", {}).get("name", "")), reverse=True)
+    if not ranked or team_match_score(team_name, ranked[0].get("team", {}).get("name", "")) < 0.60:
+        return None
+    return ranked[0].get("team", {}).get("id")
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def recent_team_fixtures(team_id, before_date, last=12):
+    resp, err = get_football("/fixtures", {"team": team_id, "last": last, "status": "FT", "to": before_date})
+    if err:
+        return None
+    return resp or []
+
+def summarize_team_fixtures(fixtures, team_id):
+    scored, conceded, home_scored, home_conceded, away_scored, away_conceded = [], [], [], [], [], []
+    for f in fixtures or []:
+        teams, goals = f.get("teams", {}), f.get("goals", {})
+        h_id = teams.get("home", {}).get("id")
+        a_id = teams.get("away", {}).get("id")
+        hg, ag = number(goals.get("home")), number(goals.get("away"))
+        if hg is None or ag is None:
+            continue
+        if h_id == team_id:
+            scored.append(hg); conceded.append(ag); home_scored.append(hg); home_conceded.append(ag)
+        elif a_id == team_id:
+            scored.append(ag); conceded.append(hg); away_scored.append(ag); away_conceded.append(hg)
+    if len(scored) < 4:
+        return None
+    avg = lambda xs, fallback: (sum(xs) / len(xs)) if xs else fallback
+    return {
+        "n": len(scored), "scored": avg(scored, 1.2), "conceded": avg(conceded, 1.2),
+        "home_scored": avg(home_scored, avg(scored, 1.2)),
+        "home_conceded": avg(home_conceded, avg(conceded, 1.2)),
+        "away_scored": avg(away_scored, avg(scored, 1.2)),
+        "away_conceded": avg(away_conceded, avg(conceded, 1.2)),
+    }
+
+def independent_football_model(home, away, kickoff_iso):
+    if not FOOTBALL_KEY:
+        return None, "Cần thêm API_FOOTBALL_KEY trong Streamlit Secrets để lấy kết quả lịch sử; chưa thể tính mô hình độc lập."
+    kick = dt_parse(kickoff_iso)
+    if not kick:
+        return None, "Không xác định được ngày trận."
+    h_id, a_id = team_id_search(home), team_id_search(away)
+    if not h_id or not a_id:
+        return None, "Không ghép được ID hai đội từ API-Football."
+    cutoff = (kick.astimezone(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    hf, af = recent_team_fixtures(h_id, cutoff), recent_team_fixtures(a_id, cutoff)
+    if hf is None or af is None:
+        return None, "Không truy vấn được lịch sử; kiểm tra khóa API hoặc hạn mức."
+    hs, ass = summarize_team_fixtures(hf, h_id), summarize_team_fixtures(af, a_id)
+    if not hs or not ass:
+        return None, "Chưa đủ ít nhất 4 trận đã kết thúc cho mỗi đội."
+    # League-wide neutral baseline; shrunk towards 1.25 goals to reduce small-sample extremes.
+    home_attack = 0.65 * hs["home_scored"] + 0.35 * hs["scored"]
+    home_def_weakness = 0.65 * ass["away_conceded"] + 0.35 * ass["conceded"]
+    away_attack = 0.65 * ass["away_scored"] + 0.35 * ass["scored"]
+    away_def_weakness = 0.65 * hs["home_conceded"] + 0.35 * hs["conceded"]
+    h_lam = max(0.15, min(3.8, 0.5 * home_attack + 0.5 * home_def_weakness))
+    a_lam = max(0.15, min(3.8, 0.5 * away_attack + 0.5 * away_def_weakness))
+    probs = poisson_1x2(h_lam, a_lam)
+    return {
+        "home_lambda": h_lam, "away_lambda": a_lam, "probs": probs,
+        "sample_home": hs["n"], "sample_away": ass["n"],
+        "expected_total": h_lam + a_lam,
+    }, None
+
+def tennis_elo_from_csv(uploaded, player_a, player_b, surface=None):
+    """CSV columns: winner, loser; optional surface. Computes Elo from historic match order."""
+    try:
+        raw = uploaded.getvalue().decode("utf-8-sig")
+        rows = list(csv.DictReader(StringIO(raw)))
+    except Exception:
+        return None, "Không đọc được CSV. Hãy lưu CSV dạng UTF-8."
+    if not rows or not {"winner", "loser"}.issubset({x.strip().lower() for x in rows[0].keys()}):
+        return None, "CSV cần có hai cột tên chính xác: winner, loser; có thể thêm cột surface."
+    # Normalize field names.
+    norm = [{str(k).strip().lower(): (v or "").strip() for k, v in r.items()} for r in rows]
+    elo = {}
+    used = 0
+    for r in norm:
+        if surface and r.get("surface") and r["surface"].lower() != surface.lower():
+            continue
+        w, l = r.get("winner", ""), r.get("loser", "")
+        if not w or not l:
+            continue
+        ew, el = elo.get(w, 1500.0), elo.get(l, 1500.0)
+        expected = 1 / (1 + 10 ** ((el - ew) / 400))
+        k = 32
+        elo[w] = ew + k * (1 - expected)
+        elo[l] = el + k * (0 - (1 - expected))
+        used += 1
+    if used < 50:
+        return None, f"Chỉ có {used} trận hợp lệ sau lọc; cần tối thiểu 50 trận lịch sử để hiển thị tham khảo."
+    ra, rb = elo.get(player_a, 1500.0), elo.get(player_b, 1500.0)
+    p = 1 / (1 + 10 ** ((rb - ra) / 400))
+    return {"p_a": p, "p_b": 1-p, "elo_a": ra, "elo_b": rb, "n": used}, None
+
+
 sports_data, _ = get_odds("/sports", {"all": "true"})
 if isinstance(sports_data, dict) and sports_data.get("_error"):
     st.error(sports_data["_error"])
@@ -359,27 +491,66 @@ if shortlist:
 else:
     st.warning("Chưa có kèo vượt bộ lọc. Không có đề xuất cược khi dữ liệu/giá chưa đủ thuyết phục.")
 
-if is_soccer and FOOTBALL_KEY:
-    st.subheader("⚽ Kiểm tra dự đoán bóng đá từ dữ liệu phong độ")
-    with st.spinner("Đang truy vấn API-Football để lấy dự đoán dựa trên phong độ/lịch sử..."):
-        fp, ferr = football_prediction_for_match(
+if is_soccer:
+    st.subheader("⚽ Dự đoán độc lập: mô hình bàn thắng Poisson")
+    with st.spinner("Đang tính từ các trận lịch sử đã kết thúc..."):
+        independent, model_error = independent_football_model(
             event.get("home_team", ""), event.get("away_team", ""), event.get("commence_time", "")
         )
-    if ferr:
-        st.warning(f"Chưa có dự đoán thống kê riêng: {ferr}")
+    if model_error:
+        st.warning(model_error)
     else:
-        st.caption("Nguồn mô hình ngoài: API-Football Predictions (dựa trên các đầu vào thống kê của nhà cung cấp; không phải mô hình do app tự huấn luyện).")
-        p = fp["probs"]
-        a, b, c = st.columns(3)
-        a.metric(f"{fp['home']} thắng", f"{p['home']*100:.1f}%")
-        b.metric("Hòa", f"{p['draw']*100:.1f}%")
-        c.metric(f"{fp['away']} thắng", f"{p['away']*100:.1f}%")
-        st.write(f"**Đội được nhà cung cấp nghiêng về:** {fp['winner']}")
-        if fp.get("advice"):
-            st.write(f"**Nhận định nhà cung cấp:** {fp['advice']}")
-        if fp.get("goals"):
-            st.write(f"**Dự đoán bàn thắng:** {fp['goals']}")
-        st.caption(f"Độ khớp tên trận giữa hai nguồn: {fp['match_score']*100:.0f}%. Hãy xác nhận đúng trận trước khi tham khảo.")
+        p = independent["probs"]
+        st.caption("Mô hình riêng của app dùng trung bình bàn thắng ghi/thủng lưới gần đây; chưa phải mô hình đã được backtest đầy đủ.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{event.get('home_team', 'Chủ nhà')} thắng", f"{p['home']*100:.1f}%")
+        c2.metric("Hòa", f"{p['draw']*100:.1f}%")
+        c3.metric(f"{event.get('away_team', 'Đội khách')} thắng", f"{p['away']*100:.1f}%")
+        st.write(f"Bàn thắng kỳ vọng: **{independent['home_lambda']:.2f} – {independent['away_lambda']:.2f}** (tổng {independent['expected_total']:.2f})")
+        st.caption(f"Mẫu lịch sử: {independent['sample_home']} trận đội chủ nhà, {independent['sample_away']} trận đội khách. Chưa điều chỉnh đầy đủ theo sức mạnh giải, đội hình và chấn thương.")
+        # Compute independent-model edge for exact 1X2 outcomes where a mapping is clear.
+        for r in rows:
+            if r["market_key"] in ("h2h", "h2h_3_way"):
+                sel = r["selection"].lower()
+                if event.get("home_team", "").lower() in sel:
+                    mp = p["home"]
+                elif event.get("away_team", "").lower() in sel:
+                    mp = p["away"]
+                elif "draw" in sel or "tie" in sel or "draw" == sel:
+                    mp = p["draw"]
+                else:
+                    continue
+                r["p_model"] = mp
+                r["model_edge"] = mp * r["best_odds"] - 1
+        st.markdown("**Kèo 1X2 theo mô hình độc lập**")
+        mapped = [r for r in rows if "model_edge" in r]
+        for r in sorted(mapped, key=lambda x: x["model_edge"], reverse=True):
+            st.write(f"- **{r['selection']}** · xác suất mô hình {r['p_model']*100:.1f}% · odds {r['best_odds']:.2f} · chênh lệch ước tính {r['model_edge']*100:+.1f}%")
+            if r["model_edge"] >= 0.03:
+                st.success("Có thể nghiên cứu thêm; chưa phải khuyến nghị chắc thắng.")
+            elif r["model_edge"] > 0:
+                st.info("Lợi thế ước tính mỏng; sai số mô hình có thể xóa lợi thế.")
+            else:
+                st.caption("Mô hình chưa thấy lợi thế giá ở lựa chọn này.")
+
+st.subheader("🎾 Mô hình Elo tennis từ dữ liệu lịch sử")
+st.write("Để dự đoán tennis độc lập, tải lên CSV kết quả lịch sử có cột `winner`, `loser` và tùy chọn `surface`. Không dùng odds làm đầu vào của Elo.")
+tennis_csv = st.file_uploader("CSV kết quả tennis lịch sử (tùy chọn)", type=["csv"])
+if tennis_csv is not None:
+    ta, tb = st.columns(2)
+    with ta:
+        player_a = st.text_input("Tên tay vợt A", value=event.get("home_team", ""))
+    with tb:
+        player_b = st.text_input("Tên tay vợt B", value=event.get("away_team", ""))
+    surface = st.selectbox("Mặt sân (nếu CSV có cột surface)", ["Tất cả", "Hard", "Clay", "Grass", "Carpet"])
+    if st.button("Tính Elo tennis độc lập", use_container_width=True):
+        elo_result, elo_error = tennis_elo_from_csv(tennis_csv, player_a.strip(), player_b.strip(), None if surface == "Tất cả" else surface)
+        if elo_error:
+            st.warning(elo_error)
+        else:
+            st.metric(f"{player_a} thắng theo Elo", f"{elo_result['p_a']*100:.1f}%")
+            st.metric(f"{player_b} thắng theo Elo", f"{elo_result['p_b']*100:.1f}%")
+            st.caption(f"Elo A: {elo_result['elo_a']:.0f}; Elo B: {elo_result['elo_b']:.0f}; số trận dùng: {elo_result['n']}. Mẫu tối thiểu không đảm bảo dữ liệu đủ đại diện.")
 
 st.subheader("📊 Tất cả lựa chọn")
 display = []
@@ -388,6 +559,7 @@ for r in rows:
         "Thị trường": r["market"],
         "Lựa chọn": r["selection"],
         "Xác suất tham chiếu": f"{r['p_market']*100:.1f}%",
+        "Xác suất mô hình độc lập": f"{r['p_model']*100:.1f}%" if "p_model" in r else "—",
         "Hòa vốn": f"{r['p_be']*100:.1f}%",
         "Odds tốt nhất": round(r["best_odds"], 3),
         "Fair odds": round(r["fair_odds"], 3),
