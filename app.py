@@ -3,151 +3,147 @@ import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Esports Prediction Lab", page_icon="🎮", layout="wide")
-st.title("🎮 Esports Prediction Lab")
-st.caption("Ứng dụng riêng cho esports: CS2, LoL, Dota 2, Valorant và các giải mà nguồn dữ liệu cung cấp.")
-st.warning("Bảng odds không phải dự đoán độc lập đã kiểm chứng. Ứng dụng không tự bịa trận đấu hoặc xác suất khi thiếu dữ liệu.")
+BASE_URL = "https://oddiwire.com/v1"
 
-BASE = "https://api.the-odds-api.com/v4"
-def secret(name):
+st.set_page_config(page_title="Esports Odds Analyzer", page_icon="🎮", layout="wide")
+st.title("🎮 Esports Odds Analyzer")
+st.caption("CS2 • League of Legends • Dota 2 • Valorant • các game esports khác")
+
+st.warning(
+    "Ứng dụng này phân tích odds và xác suất do nhà cung cấp trả về; "
+    "đây không phải mô hình AI độc lập đã được kiểm định và không bảo đảm kết quả."
+)
+
+def get_api_key():
     try:
-        v = st.secrets.get(name, "")
-        if v: return str(v).strip()
-    except Exception: pass
-    return os.getenv(name, "").strip()
+        return st.secrets.get("ODDIWIRE_API_KEY", "")
+    except Exception:
+        return os.getenv("ODDIWIRE_API_KEY", "")
 
-KEY = secret("THE_ODDS_API_KEY")
-def get(path, params=None):
-    if not KEY: raise RuntimeError("Thiếu THE_ODDS_API_KEY trong Streamlit Secrets.")
-    p = dict(params or {})
-    p["apiKey"] = KEY
-    r = requests.get(BASE + path, params=p, timeout=25)
-    if r.status_code == 401: raise RuntimeError("API key bị từ chối (401). Kiểm tra key tại nhà cung cấp.")
-    if r.status_code == 403: raise RuntimeError("Gói API không có quyền truy cập dữ liệu/market này (403).")
-    if r.status_code == 429: raise RuntimeError("Đã hết hạn mức API (429).")
-    if not r.ok: raise RuntimeError(f"API lỗi HTTP {r.status_code}: {r.text[:200]}")
-    return r.json()
+def fetch_fixtures(api_key, event_type, sport, limit):
+    headers = {"x-api-key": api_key} if api_key else {}
+    params = {"event_type": event_type, "limit": limit}
+    if sport != "Tất cả":
+        params["sport"] = sport
+    response = requests.get(
+        f"{BASE_URL}/fixtures",
+        headers=headers,
+        params=params,
+        timeout=25,
+    )
+    if response.status_code == 401:
+        raise RuntimeError("API key không hợp lệ hoặc chưa được gửi. Kiểm tra ODDIWIRE_API_KEY trong Streamlit Secrets.")
+    if response.status_code == 429:
+        raise RuntimeError("Đã vượt giới hạn request. Chờ theo thời gian nhà cung cấp trả về hoặc kiểm tra gói API.")
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "fixtures", "results", "items"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+        # Một số API trả object đơn lẻ
+        if payload.get("id"):
+            return [payload]
+    return []
 
-with st.sidebar:
-    st.header("Cài đặt")
-    region = st.selectbox("Khu vực nhà cái", ["us", "uk", "eu", "au", "us,uk,eu"])
-    fmt_label = st.selectbox("Định dạng odds", ["Decimal", "American"])
-    fmt = "decimal" if fmt_label == "Decimal" else "american"
-    markets = st.multiselect("Thị trường", ["h2h", "spreads", "totals"],
-        default=["h2h"], format_func=lambda x: {"h2h":"Đội thắng / Moneyline","spreads":"Handicap","totals":"Tổng điểm/map"}[x])
-    threshold = st.slider("Ngưỡng lọc chênh lệch giá (điểm %)", 0, 15, 3)
-
-if not KEY:
-    st.error("Chưa cấu hình THE_ODDS_API_KEY. Mở Manage app → Settings → Secrets.")
-    st.stop()
-
-@st.cache_data(ttl=900, show_spinner=False)
-def sports(_marker):
-    return get("/sports/")
-
-@st.cache_data(ttl=90, show_spinner=False)
-def odds(sport_key, region, markets, fmt, _marker):
-    return get(f"/sports/{sport_key}/odds/", {"regions":region,"markets":markets,"oddsFormat":fmt,"dateFormat":"iso"})
-
-try:
-    catalog = sports(KEY[-4:])
-except Exception as e:
-    st.error(str(e)); st.stop()
-
-# Only display entries whose names indicate esports; don't mislabel traditional sports.
-terms = ["esport","e-sport","counter-strike","cs2","league of legends","dota","valorant","rainbow six","call of duty","rocket league","starcraft","overwatch"]
-esports = []
-for x in catalog or []:
-    label = f'{x.get("key","")} {x.get("title","")} {x.get("group","")}'.lower()
-    if any(t in label for t in terms): esports.append(x)
-
-st.subheader("1. Chọn tựa game / giải")
-if not esports:
-    st.warning("API key chưa trả về giải nào có tên nhận diện là esports. Có thể nhà cung cấp hoặc gói hiện tại không hỗ trợ esports.")
-    st.write("Danh mục API hiện trả về (để kiểm tra quyền dữ liệu):")
-    st.dataframe(pd.DataFrame([{"Tên":x.get("title"),"Nhóm":x.get("group"),"Mã":x.get("key"),"Đang hoạt động":x.get("active")} for x in catalog or []]), use_container_width=True, hide_index=True)
-    st.stop()
-
-esports = sorted(esports, key=lambda x:(str(x.get("group","")),str(x.get("title",""))))
-labels = [f'{x.get("title",x.get("key"))} ({x.get("key")})' for x in esports]
-chosen = st.selectbox("Giải đấu", labels)
-sport = esports[labels.index(chosen)]
-st.caption(f'Mã giải: {sport.get("key")}')
-
-st.subheader("2. Tải trận đấu và odds")
-st.info("Bản đầu này phân tích xác suất ngầm định từ thị trường. Dự đoán độc lập cho từng game cần dữ liệu lịch sử riêng và phải backtest.")
-if not markets:
-    st.info("Chọn ít nhất một thị trường ở thanh Cài đặt.")
-    st.stop()
-if st.button("🔄 Tải odds và phân tích", type="primary", use_container_width=True):
-    st.session_state["esports_run"] = True
-
-def decimal(price):
-    try:
-        p = float(price)
-        if fmt == "decimal": return p if p > 1 else None
-        if p > 0: return 1 + p/100
-        if p < 0: return 1 + 100/abs(p)
-    except Exception: pass
-    return None
-
-def rows_from_events(events):
+def normalize_fixture(f):
+    competitors = f.get("competitors") or f.get("teams") or []
+    team_names = []
+    if isinstance(competitors, list):
+        for team in competitors:
+            if isinstance(team, dict):
+                team_names.append(str(team.get("name") or team.get("team_name") or team.get("title") or ""))
+            elif isinstance(team, str):
+                team_names.append(team)
+    markets = f.get("markets") or []
     rows = []
-    for ev in events:
-        # Market groups are normalized per bookmaker, market and line.
-        grouped = {}
-        for book in ev.get("bookmakers", []):
-            for market in book.get("markets", []):
-                if market.get("key") not in markets: continue
-                outs = []
-                for o in market.get("outcomes", []):
-                    d = decimal(o.get("price"))
-                    if d:
-                        outs.append({"selection":o.get("name",""),"description":o.get("description",""),
-                                     "point":o.get("point"),"book":book.get("title",book.get("key","")),
-                                     "odds":d,"implied":1/d,"market":market.get("key","")})
-                total = sum(o["implied"] for o in outs)
-                for o in outs:
-                    o["fair"] = o["implied"]/total if total else None
-                    k=(o["market"],o["selection"],o["description"],o["point"])
-                    grouped.setdefault(k,[]).append(o)
-        for (m,sel,desc,point), items in grouped.items():
-            fairvals=[x["fair"] for x in items if x["fair"] is not None]
-            if not fairvals: continue
-            fair=sum(fairvals)/len(fairvals)
-            best=max(items,key=lambda x:x["odds"])
-            rows.append({"Bắt đầu (UTC)":ev.get("commence_time",""),
-                         "Trận đấu":f'{ev.get("home_team","")} vs {ev.get("away_team","")}'.strip(" vs"),
-                         "Thị trường":m,"Lựa chọn":sel,"Đội/người chơi":desc,"Mốc kèo":point,
-                         "Odds tốt nhất":best["odds"],"Nhà cái tốt nhất":best["book"],
-                         "Xác suất thị trường (%)":round(fair*100,2),
-                         "Chênh lệch giá (điểm %)":round((fair-1/best["odds"])*100,2)})
+    for market in markets if isinstance(markets, list) else []:
+        if not isinstance(market, dict):
+            continue
+        selections = market.get("selections") or []
+        for sel in selections if isinstance(selections, list) else []:
+            if not isinstance(sel, dict):
+                continue
+            price = sel.get("price")
+            prob = sel.get("probability")
+            try:
+                price = float(price) if price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            try:
+                prob = float(prob) * 100 if prob is not None else None
+            except (TypeError, ValueError):
+                prob = None
+            rows.append({
+                "Game": f.get("sport", ""),
+                "Trạng thái": f.get("phase") or f.get("status") or "",
+                "Giải đấu": (f.get("competition") or {}).get("name", "") if isinstance(f.get("competition"), dict) else str(f.get("competition", "")),
+                "Trận đấu": " vs ".join([x for x in team_names if x]) or f.get("name", "Chưa rõ"),
+                "Giờ thi đấu": f.get("start_time") or f.get("scheduled_at") or f.get("startTime") or "",
+                "Thị trường": market.get("market") or market.get("canonical") or "",
+                "Loại thị trường": market.get("canonical", ""),
+                "Lựa chọn": sel.get("name") or sel.get("side") or sel.get("label") or "",
+                "Mốc kèo": sel.get("line"),
+                "Odds": price,
+                "Xác suất nhà cung cấp (%)": round(prob, 2) if prob is not None else None,
+                "Trạng thái kèo": market.get("status", ""),
+            })
     return rows
 
-if st.session_state.get("esports_run"):
-    try:
-        with st.spinner("Đang tải dữ liệu esports..."):
-            events=odds(sport["key"],region,",".join(markets),fmt,KEY[-4:])
-        if not events:
-            st.warning("Không có trận/odds cho giải này ở thời điểm hiện tại hoặc gói API không hỗ trợ thị trường đã chọn.")
-            st.stop()
-        rows=rows_from_events(events)
-        if not rows:
-            st.warning("API có sự kiện nhưng không có odds phù hợp.")
-            st.stop()
-        df=pd.DataFrame(rows)
-        df["Bắt đầu (UTC)"]=pd.to_datetime(df["Bắt đầu (UTC)"],errors="coerce",utc=True).dt.strftime("%d/%m/%Y %H:%M")
-        query=st.text_input("Tìm đội / tuyển thủ")
-        if query.strip(): df=df[df["Trận đấu"].str.contains(query.strip(),case=False,na=False)]
-        st.metric("Số trận có dữ liệu",df["Trận đấu"].nunique())
-        st.dataframe(df,use_container_width=True,hide_index=True)
-        st.subheader(f"Lọc chênh lệch giá ≥ {threshold} điểm %")
-        shortlist=df[df["Chênh lệch giá (điểm %)"]>=threshold].sort_values("Chênh lệch giá (điểm %)",ascending=False)
-        if shortlist.empty: st.info("Không có lựa chọn đạt ngưỡng. Không ép ra kèo khi dữ liệu chưa ủng hộ.")
-        else: st.dataframe(shortlist,use_container_width=True,hide_index=True)
-        st.download_button("⬇️ Tải CSV",df.to_csv(index=False).encode("utf-8-sig"),"esports_analysis.csv","text/csv")
-    except Exception as e:
-        st.error(str(e))
+with st.sidebar:
+    st.header("Bộ lọc")
+    event_type = st.radio("Loại trận", ["prematch", "live"], format_func=lambda x: "Sắp diễn ra" if x == "prematch" else "Đang live")
+    sport = st.selectbox("Game", ["Tất cả", "CS2", "LOL", "DOTA2", "VALORANT", "R6", "KING_OF_GLORY", "EFOOTBALL", "EBASKETBALL"])
+    limit = st.slider("Số trận tối đa", 10, 200, 50, step=10)
+    use_demo = st.checkbox("Dùng khóa demo để thử (giới hạn)", value=False)
 
-with st.expander("Lộ trình mô hình dự đoán độc lập"):
-    st.markdown("Để dự đoán thực sự cho CS2/LoL/Dota 2/Valorant cần lịch sử trận, đội hình, map/patch, tỷ lệ thắng map/round, giải đấu và kết quả trước trận. Sau đó mới huấn luyện Elo hoặc mô hình ML, kiểm định theo thời gian và hiệu chỉnh xác suất. Không nên dùng odds nhà cái làm bằng chứng rằng mô hình đã dự đoán độc lập.")
+key = get_api_key()
+if not key and use_demo:
+    key = "demo"
+elif not key:
+    st.info(
+        "Chưa tìm thấy API key. Bạn có thể bật “Dùng khóa demo để thử” ở thanh bên, "
+        "hoặc thêm ODDIWIRE_API_KEY vào Streamlit → Settings → Secrets."
+    )
+
+if st.button("🔄 Tải dữ liệu", type="primary") or "fixtures_rows" not in st.session_state:
+    if not key:
+        st.stop()
+    with st.spinner("Đang tải dữ liệu từ Oddiwire…"):
+        try:
+            fixtures = fetch_fixtures(key, event_type, sport, limit)
+            rows = []
+            for fixture in fixtures:
+                rows.extend(normalize_fixture(fixture))
+            st.session_state["fixtures_rows"] = rows
+            st.session_state["fixtures_count"] = len(fixtures)
+            st.session_state["last_error"] = ""
+        except Exception as e:
+            st.session_state["last_error"] = str(e)
+
+if st.session_state.get("last_error"):
+    st.error(st.session_state["last_error"])
+elif "fixtures_rows" in st.session_state:
+    rows = st.session_state["fixtures_rows"]
+    st.metric("Số trận nhận được", st.session_state.get("fixtures_count", 0))
+    if not rows:
+        st.warning("API chưa trả về trận/kèo phù hợp với bộ lọc này. Thử chọn 'Tất cả', đổi loại trận hoặc kiểm tra quyền truy cập/gói API.")
+    else:
+        df = pd.DataFrame(rows)
+        query = st.text_input("Tìm đội, giải đấu hoặc thị trường")
+        if query:
+            mask = df.astype(str).apply(lambda col: col.str.contains(query, case=False, na=False)).any(axis=1)
+            df = df[mask]
+        min_prob = st.slider("Lọc xác suất tối thiểu (%)", 0, 100, 0)
+        if "Xác suất nhà cung cấp (%)" in df.columns:
+            df = df[(df["Xác suất nhà cung cấp (%)"].isna()) | (df["Xác suất nhà cung cấp (%)"] >= min_prob)]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Tải bảng CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="esports_odds.csv",
+            mime="text/csv",
+        )
+        st.caption("Xác suất là số do API cung cấp; không đồng nghĩa với xác suất thắng chắc chắn.")
