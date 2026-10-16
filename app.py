@@ -237,55 +237,74 @@ with tab_predict:
     with col_b:
         elo_b = st.slider("Sức mạnh B (Elo tham khảo)", 1000, 2000, int(DEFAULT_RATINGS.get(team_b, 1500)), 5, key="elo_b")
     bo = st.selectbox("Thể thức series", [1, 3, 5], index=1, format_func=lambda x: f"BO{x}")
-    st.markdown("#### Giá cược hiện tại (nếu có) — nhập để kiểm tra value")
-    odds_col_a, odds_col_b = st.columns(2)
-    with odds_col_a:
-        odds_a = st.number_input(f"Odds thắng {team_a or 'đội A'}", min_value=1.01, max_value=100.0, value=1.90, step=0.05)
-    with odds_col_b:
-        odds_b = st.number_input(f"Odds thắng {team_b or 'đội B'}", min_value=1.01, max_value=100.0, value=1.90, step=0.05)
-
-    if st.button("🔮 Phân tích và gợi ý kèo", type="primary"):
-        if not team_a.strip() or not team_b.strip() or team_a.strip().lower() == team_b.strip().lower():
-            st.error("Nhập tên hai đội khác nhau trước khi dự đoán.")
+    st.markdown("#### 📡 Odds nhà cái — tự động lấy từ KashRock")
+    if st.button("📥 Tự tải odds", type="primary"):
+        current_game = st.session_state.get("schedule_game", "League of Legends")
+        key = secret("KASHROCK_API_KEY")
+        if not key:
+            st.session_state["auto_market_error"] = "Thiếu KASHROCK_API_KEY trong Streamlit Secrets."
+            st.session_state["auto_market_data"] = None
         else:
-            p_map_a = elo_prob(elo_a, elo_b)
-            p_series_a = series_prob(p_map_a, bo)
-            p_series_b = 1 - p_series_a
-            st.markdown("### Xác suất thắng series")
-            c1, c2 = st.columns(2)
-            c1.metric(f"{team_a} thắng", f"{p_series_a*100:.1f}%")
-            c2.metric(f"{team_b} thắng", f"{p_series_b*100:.1f}%")
-            st.progress(max(0, min(100, round(p_series_a*100))))
+            slug = GAMES[current_game]["kash_slug"]
+            try:
+                response = requests.get(
+                    f"https://kashrock.up.railway.app/v7/{slug}/lines",
+                    headers={"X-API-Key": key, "Accept": "application/json"},
+                    params={"include_started": "false"}, timeout=20)
+                response.raise_for_status()
+                st.session_state["auto_market_data"] = response.json()
+                st.session_state["auto_market_error"] = None
+                st.session_state["auto_market_game"] = current_game
+            except requests.HTTPError:
+                if response.status_code == 403:
+                    msg = "KashRock báo 403: odds nhà cái/consensus qua endpoint /lines cần gói Hobby trở lên. Gói miễn phí không mở endpoint này."
+                else:
+                    msg = f"KashRock trả lỗi HTTP {response.status_code} khi tải odds."
+                st.session_state["auto_market_error"] = msg
+                st.session_state["auto_market_data"] = None
+            except Exception as e:
+                st.session_state["auto_market_error"] = f"Không tải được odds: {e}"
+                st.session_state["auto_market_data"] = None
 
-            # Expected value per unit stake, using user-entered decimal odds.
-            ev_a = p_series_a * odds_a - 1
-            ev_b = p_series_b * odds_b - 1
-            st.markdown("### Gợi ý kèo")
-            if bo == 1:
-                st.write(f"**Kèo thắng trận:** {team_a if p_series_a >= p_series_b else team_b} có xác suất cao hơn theo Elo.")
-            else:
-                st.write(f"**Kèo thắng series:** {team_a if p_series_a >= p_series_b else team_b} là lựa chọn có xác suất mô hình cao hơn.")
-                st.write(f"**Kèo tổng số map:** mô hình chỉ ước tính từ xác suất thắng từng map; không có dữ liệu lịch sử map nên chưa đủ cơ sở để khuyến nghị Over/Under đáng tin cậy.")
-                st.write(f"**Kèo tỷ số series:** {team_a} thắng {bo//2+1}-0 hoặc {team_b} thắng {bo//2+1}-0 có thể được tính riêng, nhưng hiện chưa có dữ liệu map đủ tốt để xếp hạng chính xác các tỷ số.")
-            st.markdown("#### Kiểm tra value theo odds bạn nhập")
-            v1, v2 = st.columns(2)
-            v1.metric(f"EV {team_a}", f"{ev_a*100:+.1f}%")
-            v2.metric(f"EV {team_b}", f"{ev_b*100:+.1f}%")
-            if max(ev_a, ev_b) > 0:
-                value_team = team_a if ev_a >= ev_b else team_b
-                value_ev = max(ev_a, ev_b)
-                if value_ev > 0:
-                    st.success(f"Theo các odds bạn nhập, {value_team} có EV dương ước tính ({value_ev*100:+.1f}%). Đây là tín hiệu cần kiểm tra thêm, không bảo đảm có lời.")
-            else:
-                st.warning("Chưa có kèo value theo mô hình ở mức odds đã nhập (EV không dương). Cân nhắc bỏ qua trận này.")
-            st.warning("Giới hạn hiện tại: xác suất dựa trên Elo tham khảo, chưa học từ phong độ gần đây, đội hình, bản đồ, patch hay odds thị trường. Không xem đây là dự đoán chắc thắng; chỉ dùng để tham khảo.")
+    market_data = st.session_state.get("auto_market_data")
+    market_error = st.session_state.get("auto_market_error")
+    if market_data is not None:
+        rows = market_data if isinstance(market_data, list) else (
+            market_data.get("lines") or market_data.get("markets") or
+            market_data.get("events") or market_data.get("data") or
+            market_data.get("results") or [])
+        if isinstance(rows, dict):
+            rows = [dict(v, book_name=k) if isinstance(v, dict) else {"book_name": k, "data": v}
+                    for k, v in rows.items()]
+        if rows:
+            st.success(f"Đã nhận {len(rows)} mục thị trường từ KashRock.")
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("API phản hồi nhưng chưa tìm thấy danh sách lines ở các trường phổ biến.")
+            with st.expander("Xem phản hồi API"):
+                st.json(market_data)
+    elif market_error:
+        st.warning(market_error)
+    else:
+        st.info("Nhấn **Tự tải odds** để lấy dữ liệu tự động. Không cần nhập odds thủ công.")
+
+    if team_a.strip() and team_b.strip() and team_a.strip().lower() != team_b.strip().lower():
+        p_map_a = elo_prob(elo_a, elo_b)
+        p_series_a = series_prob(p_map_a, bo)
+        p_series_b = 1 - p_series_a
+        st.markdown("### Dự đoán tham khảo theo Elo")
+        c1, c2 = st.columns(2)
+        c1.metric(f"{team_a} thắng", f"{p_series_a*100:.1f}%")
+        c2.metric(f"{team_b} thắng", f"{p_series_b*100:.1f}%")
+        st.write(f"**Ưu tiên theo Elo:** {team_a if p_series_a >= p_series_b else team_b}.")
+        st.caption("Odds tự động phụ thuộc quyền API của KashRock. Xác suất Elo chỉ là tham khảo, chưa được kiểm định và không đảm bảo lợi nhuận.")
 
 with tab_setup:
     st.subheader("Thêm API key an toàn")
     st.write("Trong Streamlit Cloud: mở app → Settings → Secrets. Không đăng key lên GitHub và không gửi key trong chat.")
     st.code('KASHROCK_API_KEY = "dan_key_cua_ban"', language="toml")
-    st.markdown("- **KashRock**: lịch trận sắp tới cho LoL, VALORANT và CS2. Tài liệu: https://www.kashrock.com/docs/endpoints/matches")
+    st.markdown("- **KashRock**: lịch trận sắp tới cho LoL, VALORANT và CS2. Tài liệu: https://www.kashrock.com/docs · Odds nhà cái qua /v7/{sport}/lines cần gói Hobby trở lên.")
     st.caption("KashRock là nguồn ưu tiên. Cito/PandaScore chỉ được dùng làm phương án dự phòng nếu bạn đã cấu hình các key đó.")
 
 st.divider()
-st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Gợi ý kèo và EV chỉ là ước tính theo Elo cùng odds do bạn nhập; chưa phải mô hình đã được kiểm định và không bảo đảm lợi nhuận.")
+st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Odds tự động được lấy từ KashRock nếu gói API cho phép. Dự đoán Elo là tham khảo, chưa được kiểm định và không bảo đảm lợi nhuận.")
