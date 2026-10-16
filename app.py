@@ -1,265 +1,207 @@
-
 import os
 import math
-import random
 import requests
-import pandas as pd
 import streamlit as st
+from datetime import datetime
 
-st.set_page_config(
-    page_title="Worlds 2026 Predictor",
-    page_icon="🏆",
-    layout="wide",
-)
+st.set_page_config(page_title="Esports Match Predictor", page_icon="🎮", layout="wide")
+st.title("🎮 Esports Match Predictor")
+st.caption("Lịch thi đấu sắp tới và xác suất thắng tham khảo cho VALORANT, CS2 và League of Legends.")
 
-st.title("🏆 Worlds 2026 Predictor")
-st.caption("League of Legends • Dự đoán CKTG • Tối ưu cho điện thoại")
+CITO_BASE = "https://api.citoapi.com/api/v1"
+PANDASCORE_BASE = "https://api.pandascore.co"
 
-st.info(
-    "Dự đoán mang tính tham khảo. Khi chưa có dữ liệu thi đấu xác thực, "
-    "hãy nhập sức mạnh đội theo đánh giá của bạn; app không tự tạo kết quả thật."
-)
+# These are fallback ratings only, not live rankings. Unknown teams start at 1500.
+DEFAULT_RATINGS = {
+    "Gen.G": 1740, "T1": 1725, "Hanwha Life Esports": 1685,
+    "KT Rolster": 1640, "Dplus KIA": 1600, "Bilibili Gaming": 1710,
+    "Top Esports": 1665, "Anyone's Legend": 1615, "JD Gaming": 1590,
+    "Weibo Gaming": 1575, "G2 Esports": 1600, "Fnatic": 1535,
+    "Movistar KOI": 1510, "FlyQuest": 1550, "Team Liquid": 1540,
+    "Cloud9": 1500, "GAM Esports": 1480, "PSG Talon": 1490,
+    "Sentinels": 1650, "Fnatic VALORANT": 1600, "Paper Rex": 1660,
+    "EDward Gaming": 1640, "Team Heretics": 1600, "LOUD VALORANT": 1570,
+    "NAVI": 1600, "Vitality": 1660, "MOUZ": 1640, "FaZe Clan": 1620,
+    "Natus Vincere": 1600, "The MongolZ": 1610, "Team Spirit": 1670,
+    "G2 Esports CS2": 1640, "Aurora": 1620,
+}
 
-# ---------- DATA ----------
-DEFAULT_TEAMS = [
-    {"Đội": "T1", "Khu vực": "LCK", "Sức mạnh": 85},
-    {"Đội": "Gen.G", "Khu vực": "LCK", "Sức mạnh": 88},
-    {"Đội": "Hanwha Life Esports", "Khu vực": "LCK", "Sức mạnh": 82},
-    {"Đội": "KT Rolster", "Khu vực": "LCK", "Sức mạnh": 78},
-    {"Đội": "Bilibili Gaming", "Khu vực": "LPL", "Sức mạnh": 84},
-    {"Đội": "Top Esports", "Khu vực": "LPL", "Sức mạnh": 81},
-    {"Đội": "Anyone's Legend", "Khu vực": "LPL", "Sức mạnh": 79},
-    {"Đội": "Weibo Gaming", "Khu vực": "LPL", "Sức mạnh": 77},
-    {"Đội": "G2 Esports", "Khu vực": "LEC", "Sức mạnh": 79},
-    {"Đội": "Movistar KOI", "Khu vực": "LEC", "Sức mạnh": 73},
-    {"Đội": "Fnatic", "Khu vực": "LEC", "Sức mạnh": 72},
-    {"Đội": "Team Heretics", "Khu vực": "LEC", "Sức mạnh": 69},
-    {"Đội": "FlyQuest", "Khu vực": "LTA", "Sức mạnh": 76},
-    {"Đội": "Cloud9", "Khu vực": "LTA", "Sức mạnh": 72},
-    {"Đội": "100 Thieves", "Khu vực": "LTA", "Sức mạnh": 68},
-    {"Đội": "PSG Talon", "Khu vực": "LCP", "Sức mạnh": 73},
-    {"Đội": "CTBC Flying Oyster", "Khu vực": "LCP", "Sức mạnh": 74},
-    {"Đội": "GAM Esports", "Khu vực": "LCP", "Sức mạnh": 69},
-    {"Đội": "Vikings Esports", "Khu vực": "LCP", "Sức mạnh": 67},
-]
+GAMES = {
+    "League of Legends": {"panda_slug": "lol", "cito_path": "/lol/schedule/upcoming"},
+    "VALORANT": {"panda_slug": "valorant", "cito_path": None},
+    "Counter-Strike 2": {"panda_slug": "csgo", "cito_path": None},
+}
 
-if "teams" not in st.session_state:
-    st.session_state.teams = pd.DataFrame(DEFAULT_TEAMS)
 
-def probability(a, b):
-    # Elo-style estimate; this is a simple heuristic, not a trained model.
-    return 1 / (1 + 10 ** ((b - a) / 16))
-
-def simulate_series(a, b, best_of, rng):
-    wins_needed = best_of // 2 + 1
-    wa, wb = 0, 0
-    p = probability(a, b)
-    while wa < wins_needed and wb < wins_needed:
-        if rng.random() < p:
-            wa += 1
-        else:
-            wb += 1
-    return wa, wb
-
-def get_schedule():
-    """Optional integration: requires a compatible endpoint and API key."""
+def secret(name):
     try:
-        api_key = st.secrets.get("LOL_ESPORTS_API_KEY", "")
+        return str(st.secrets.get(name, "")).strip()
     except Exception:
-        api_key = os.getenv("LOL_ESPORTS_API_KEY", "")
+        return os.getenv(name, "").strip()
 
-    endpoint = os.getenv("LOL_ESPORTS_SCHEDULE_URL", "")
-    if not api_key or not endpoint:
-        return None, "Chưa cấu hình nguồn lịch tự động."
 
-    try:
-        response = requests.get(
-            endpoint,
-            headers={"x-api-key": api_key},
-            timeout=15,
-        )
-        response.raise_for_status()
-        return response.json(), None
-    except Exception as exc:
-        return None, f"Không lấy được lịch tự động: {exc}"
+def elo_prob(r_a, r_b):
+    return 1 / (1 + 10 ** ((r_b - r_a) / 400))
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "⚔️ Dự đoán trận",
-    "🏆 Ứng viên vô địch",
-    "📋 Danh sách đội",
-    "📅 Lịch thi đấu",
-])
 
-teams = st.session_state.teams.copy()
-teams["Sức mạnh"] = pd.to_numeric(
-    teams["Sức mạnh"], errors="coerce"
-).fillna(50).clip(1, 100)
+def series_prob(p, best_of):
+    needed = best_of // 2 + 1
+    return sum(math.comb(best_of, k) * p**k * (1-p)**(best_of-k)
+               for k in range(needed, best_of + 1))
 
-with tab1:
-    st.subheader("Dự đoán hai đội")
-    names = teams["Đội"].astype(str).tolist()
 
-    if len(names) < 2:
-        st.warning("Cần nhập ít nhất hai đội.")
-    else:
-        c1, c2 = st.columns(2)
-        team_a = c1.selectbox("Đội A", names, index=0)
-        team_b = c2.selectbox(
-            "Đội B", names, index=1 if len(names) > 1 else 0
-        )
-        series = st.radio(
-            "Thể thức",
-            ["BO1", "BO3", "BO5"],
-            horizontal=True,
-            index=1,
-        )
+def get_json(url, headers=None, params=None):
+    r = requests.get(url, headers=headers or {}, params=params or {}, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-        if team_a == team_b:
-            st.warning("Hãy chọn hai đội khác nhau.")
-        else:
-            a = float(teams.loc[teams["Đội"] == team_a, "Sức mạnh"].iloc[0])
-            b = float(teams.loc[teams["Đội"] == team_b, "Sức mạnh"].iloc[0])
-            p = probability(a, b)
 
-            st.markdown("### Tỷ lệ thắng ước tính")
-            m1, m2 = st.columns(2)
-            m1.metric(team_a, f"{p * 100:.1f}%")
-            m2.metric(team_b, f"{(1-p) * 100:.1f}%")
+def normalize_pandascore(items):
+    rows = []
+    for m in items if isinstance(items, list) else []:
+        opponents = m.get("opponents") or []
+        names = []
+        for op in opponents:
+            team = op.get("opponent") or {}
+            names.append(team.get("name") or "TBD")
+        if len(names) < 2:
+            names = (names + ["TBD", "TBD"])[:2]
+        league = m.get("league") or {}
+        serie = m.get("serie") or {}
+        rows.append({
+            "Trận": f"{names[0]} vs {names[1]}",
+            "Đội A": names[0], "Đội B": names[1],
+            "Giải": league.get("name") or serie.get("full_name") or "Chưa rõ",
+            "Bắt đầu (UTC)": m.get("begin_at") or "Chưa công bố",
+            "Trạng thái": m.get("status") or "Chưa rõ",
+            "Thể thức": m.get("match_type") or "Chưa rõ",
+            "Nguồn": "PandaScore",
+        })
+    return rows
 
-            st.progress(int(round(p * 100)))
-            st.write(
-                f"Chênh lệch sức mạnh: **{a-b:+.0f} điểm** "
-                f"(theo bảng sức mạnh đang nhập)."
-            )
 
-            best_of = int(series[-1])
-            rng = random.Random(2026)
-            sims = 5000
-            wins_a = 0
-            for _ in range(sims):
-                wa, wb = simulate_series(a, b, best_of, rng)
-                if wa > wb:
-                    wins_a += 1
-
-            st.write(
-                f"Trong mô phỏng {sims:,} loạt {series}, "
-                f"{team_a} thắng khoảng **{wins_a/sims*100:.1f}%**."
-            )
-            st.caption(
-                "Đây là mô hình Elo đơn giản dựa trên điểm sức mạnh tự nhập, "
-                "không phải dự báo đã được huấn luyện bằng dữ liệu trận thực."
-            )
-
-with tab2:
-    st.subheader("Xếp hạng ứng viên vô địch")
-    ranked = teams.sort_values("Sức mạnh", ascending=False).copy()
-    ranked.insert(0, "Hạng mô hình", range(1, len(ranked) + 1))
-    ranked["Điểm sức mạnh"] = ranked["Sức mạnh"].round(1)
-    st.dataframe(
-        ranked[["Hạng mô hình", "Đội", "Khu vực", "Điểm sức mạnh"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.caption(
-        "Thứ hạng chỉ dựa trên điểm sức mạnh trong bảng, không khẳng định "
-        "đây là danh sách hạt giống hoặc đội đã đủ điều kiện tham dự."
-    )
-
-    if len(ranked) >= 2:
-        st.subheader("Mô phỏng giải đấu loại trực tiếp")
-        n = st.selectbox("Số đội mô phỏng", [4, 8, 16], index=1)
-        eligible = ranked.head(min(n, len(ranked)))["Đội"].tolist()
-
-        if len(eligible) < n:
-            st.warning(f"Hiện chỉ có {len(eligible)} đội trong bảng.")
-        elif st.button("Chạy mô phỏng nhánh đấu"):
-            power = dict(zip(teams["Đội"], teams["Sức mạnh"]))
-            rng = random.Random()
-            round_teams = eligible[:]
-            round_num = 1
-
-            while len(round_teams) > 1:
-                st.markdown(f"**Vòng {round_num}**")
-                next_round = []
-                for i in range(0, len(round_teams), 2):
-                    left, right = round_teams[i], round_teams[i + 1]
-                    wl, wr = simulate_series(
-                        float(power[left]), float(power[right]), 5, rng
-                    )
-                    winner = left if wl > wr else right
-                    st.write(
-                        f"{left} {wl}–{wr} {right} → "
-                        f"**Đi tiếp: {winner}**"
-                    )
-                    next_round.append(winner)
-                round_teams = next_round
-                round_num += 1
-
-            st.success(f"Đội vô địch trong lần mô phỏng: {round_teams[0]}")
-
-with tab3:
-    st.subheader("Chỉnh sửa dữ liệu đội")
-    st.caption(
-        "Danh sách ban đầu là ví dụ để chạy thử, không phải danh sách "
-        "đội Worlds 2026 đã xác nhận. Hãy cập nhật theo thông tin chính thức."
-    )
-    edited = st.data_editor(
-        st.session_state.teams,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Sức mạnh": st.column_config.NumberColumn(
-                min_value=1, max_value=100, step=1
-            )
-        },
-        key="team_editor",
-    )
-
-    if st.button("Lưu bảng đội"):
-        if "Đội" in edited.columns:
-            edited = edited.dropna(subset=["Đội"])
-            edited["Đội"] = edited["Đội"].astype(str).str.strip()
-            edited = edited[edited["Đội"] != ""]
-            edited = edited.drop_duplicates(subset=["Đội"], keep="last")
-            st.session_state.teams = edited.reset_index(drop=True)
-            st.success("Đã cập nhật bảng đội.")
-            st.rerun()
-
-    uploaded = st.file_uploader("Hoặc tải CSV danh sách đội", type=["csv"])
-    if uploaded is not None:
+def load_matches(game):
+    # Cito is used for LoL if a Cito key exists; otherwise PandaScore is tried.
+    cito_key = secret("CITO_API_KEY")
+    panda_key = secret("PANDASCORE_TOKEN")
+    errors = []
+    if game == "League of Legends" and cito_key:
         try:
-            imported = pd.read_csv(uploaded)
-            required = {"Đội", "Khu vực", "Sức mạnh"}
-            if required.issubset(imported.columns):
-                st.session_state.teams = imported
-                st.success("Đã nhập CSV. Nhấn tải lại trang nếu cần.")
-            else:
-                st.error("CSV cần các cột: Đội, Khu vực, Sức mạnh.")
-        except Exception as exc:
-            st.error(f"Không đọc được CSV: {exc}")
-
-with tab4:
-    st.subheader("Lịch thi đấu")
-    st.write(
-        "Lịch chính thức cần được lấy từ một API có quyền truy cập và "
-        "cấu trúc dữ liệu phù hợp."
-    )
-    if st.button("Kiểm tra nguồn lịch tự động"):
-        data, error = get_schedule()
-        if error:
-            st.warning(error)
-            st.info(
-                "Bạn vẫn có thể dùng các chức năng dự đoán và mô phỏng. "
-                "Không có lịch giả được tự tạo."
+            data = get_json(
+                CITO_BASE + "/lol/schedule/upcoming",
+                headers={"x-api-key": cito_key, "Accept": "application/json"},
+                params={"leagueSlug": "worlds"},
             )
+            # Cito's response schema may vary by plan/version. Keep raw response available.
+            if isinstance(data, dict):
+                candidates = data.get("matches") or data.get("data") or data.get("results") or []
+            elif isinstance(data, list):
+                candidates = data
+            else:
+                candidates = []
+            rows = []
+            for m in candidates:
+                teams = m.get("teams") or m.get("opponents") or []
+                names = []
+                for t in teams:
+                    if isinstance(t, dict):
+                        names.append(t.get("name") or (t.get("team") or {}).get("name") or "TBD")
+                a = m.get("homeTeam") or m.get("home_team") or (names[0] if names else "TBD")
+                b = m.get("awayTeam") or m.get("away_team") or (names[1] if len(names) > 1 else "TBD")
+                if isinstance(a, dict): a = a.get("name", "TBD")
+                if isinstance(b, dict): b = b.get("name", "TBD")
+                rows.append({
+                    "Trận": f"{a} vs {b}", "Đội A": a, "Đội B": b,
+                    "Giải": m.get("leagueName") or m.get("league_name") or m.get("league", {}).get("name", "LoL Esports"),
+                    "Bắt đầu (UTC)": m.get("startTime") or m.get("begin_at") or m.get("start_time") or "Chưa rõ",
+                    "Trạng thái": m.get("status") or "upcoming",
+                    "Thể thức": m.get("matchType") or m.get("match_type") or "Chưa rõ",
+                    "Nguồn": "Cito API",
+                })
+            if rows:
+                return rows, None, data
+            # A valid response with a different schema is shown in raw JSON to help diagnose.
+            return [], "Cito API trả về dữ liệu nhưng chưa nhận diện được cấu trúc trận đấu.", data
+        except Exception as e:
+            errors.append(f"Cito API: {e}")
+    if panda_key:
+        slug = GAMES[game]["panda_slug"]
+        try:
+            data = get_json(
+                f"{PANDASCORE_BASE}/{slug}/matches/upcoming",
+                headers={"Authorization": f"Bearer {panda_key}"},
+                params={"per_page": 100},
+            )
+            return normalize_pandascore(data), None, data
+        except Exception as e:
+            errors.append(f"PandaScore: {e}")
+    if not cito_key and not panda_key:
+        return [], "Chưa cấu hình API key. Hãy thêm CITO_API_KEY (LoL) hoặc PANDASCORE_TOKEN (cả 3 game) trong Streamlit Secrets.", None
+    return [], " Không tải được lịch. " + " | ".join(errors), None
+
+
+tab_schedule, tab_predict, tab_setup = st.tabs(["📅 Trận sắp tới", "🔮 Dự đoán trận", "⚙️ Cấu hình API"])
+
+with tab_schedule:
+    game = st.selectbox("Chọn game", list(GAMES.keys()), key="schedule_game")
+    if st.button("🔄 Tải/cập nhật lịch", type="primary"):
+        st.session_state["match_cache"] = {}
+        rows, error, raw = load_matches(game)
+        st.session_state["match_cache"][game] = {"rows": rows, "error": error, "raw": raw}
+    cached = st.session_state.get("match_cache", {}).get(game)
+    if cached:
+        if cached["rows"]:
+            st.success(f"Đã tải {len(cached['rows'])} trận từ {cached['rows'][0]['Nguồn']}.")
+            st.dataframe([{k: v for k, v in r.items() if k not in ("Đội A", "Đội B")} for r in cached["rows"]], use_container_width=True, hide_index=True)
+            st.session_state["loaded_matches"] = cached["rows"]
+        if cached["error"]:
+            st.warning(cached["error"])
+            if cached["raw"] is not None:
+                with st.expander("Xem phản hồi API gốc"):
+                    st.json(cached["raw"])
+    else:
+        st.info("Chọn game rồi nhấn **Tải/cập nhật lịch** để lấy lịch mới nhất qua API.")
+
+with tab_predict:
+    st.subheader("Tính xác suất thắng")
+    loaded = st.session_state.get("loaded_matches", [])
+    if loaded:
+        options = [r["Trận"] for r in loaded]
+        selected = st.selectbox("Chọn trận từ lịch đã tải", options)
+        match = next(r for r in loaded if r["Trận"] == selected)
+        a_default, b_default = match["Đội A"], match["Đội B"]
+        st.caption(f"Giải: {match['Giải']} · Bắt đầu UTC: {match['Bắt đầu (UTC)']} · Nguồn: {match['Nguồn']}")
+        if a_default == "TBD" or b_default == "TBD":
+            st.warning("API chưa cung cấp đủ tên hai đội cho trận này; hãy nhập đội thủ công bên dưới.")
+    else:
+        a_default, b_default = "Gen.G", "T1"
+        st.info("Chưa tải lịch. Bạn vẫn có thể nhập đội để xem ước tính.")
+    team_a = st.text_input("Đội A", value=a_default, key="predict_a")
+    team_b = st.text_input("Đội B", value=b_default, key="predict_b")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        elo_a = st.slider("Điểm sức mạnh A (Elo tham khảo)", 1000, 2000, DEFAULT_RATINGS.get(team_a, 1500), 5)
+    with col_b:
+        elo_b = st.slider("Điểm sức mạnh B (Elo tham khảo)", 1000, 2000, DEFAULT_RATINGS.get(team_b, 1500), 5)
+    bo = st.selectbox("Thể thức series", [1, 3, 5], index=1, format_func=lambda x: f"BO{x}")
+    if st.button("🔮 Tính dự đoán", type="primary"):
+        if not team_a.strip() or not team_b.strip() or team_a.strip().lower() == team_b.strip().lower():
+            st.error("Nhập tên hai đội khác nhau.")
         else:
-            st.success("Đã nhận phản hồi từ nguồn đã cấu hình.")
-            st.json(data)
+            p = series_prob(elo_prob(elo_a, elo_b), bo)
+            c1, c2 = st.columns(2)
+            c1.metric(f"{team_a} thắng", f"{p*100:.1f}%")
+            c2.metric(f"{team_b} thắng", f"{(1-p)*100:.1f}%")
+            st.progress(max(0, min(100, round(p*100))))
+            st.write(f"**Dự đoán theo Elo:** {team_a if p >= 0.5 else team_b} có xác suất cao hơn.")
+            st.warning("Lưu ý: xác suất hiện dùng điểm Elo tham khảo, không tự động suy ra phong độ từ lịch. Điểm cho đội chưa có trong danh sách mặc định là 1500; hãy điều chỉnh dựa trên kết quả gần đây.")
+
+with tab_setup:
+    st.subheader("Thêm API key an toàn")
+    st.write("Trong Streamlit Cloud: mở app → Settings → Secrets. Không đăng key lên GitHub và không gửi key trong chat.")
+    st.code('CITO_API_KEY = "key_cua_ban"\nPANDASCORE_TOKEN = "token_cua_ban"', language="toml")
+    st.markdown("- **Cito API**: lịch LoL. Tài liệu: https://lolesportsapi.com/docs/api/league-of-legends/\n- **PandaScore**: lịch VALORANT, CS2 và LoL; cần token có quyền endpoint tương ứng: https://developers.pandascore.co/")
+    st.caption("Nếu không có token PandaScore, app vẫn chạy nhưng không thể tự lấy lịch VALORANT/CS2 từ nguồn này.")
 
 st.divider()
-st.caption(
-    "Worlds 2026 Predictor • Dự đoán chỉ mang tính tham khảo, "
-    "không bảo đảm kết quả thi đấu."
-)
+st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Mô hình dự đoán là tham khảo, không phải bảo đảm kết quả hoặc lời khuyên cá cược.")
