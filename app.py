@@ -8,6 +8,7 @@ st.set_page_config(page_title="Esports Match Predictor", page_icon="🎮", layou
 st.title("🎮 Esports Match Predictor")
 st.caption("Lịch thi đấu sắp tới và xác suất thắng tham khảo cho VALORANT, CS2 và League of Legends.")
 
+KASHROCK_BASE = "https://kashrock.up.railway.app/v6/esports"
 CITO_BASE = "https://api.citoapi.com/api/v1"
 PANDASCORE_BASE = "https://api.pandascore.co"
 
@@ -27,9 +28,9 @@ DEFAULT_RATINGS = {
 }
 
 GAMES = {
-    "League of Legends": {"panda_slug": "lol", "cito_path": "/lol/schedule/upcoming"},
-    "VALORANT": {"panda_slug": "valorant", "cito_path": None},
-    "Counter-Strike 2": {"panda_slug": "csgo", "cito_path": None},
+    "League of Legends": {"kash_slug": "lol", "panda_slug": "lol", "cito_path": "/lol/schedule/upcoming"},
+    "VALORANT": {"kash_slug": "valorant", "panda_slug": "valorant", "cito_path": None},
+    "Counter-Strike 2": {"kash_slug": "cs2", "panda_slug": "csgo", "cito_path": None},
 }
 
 
@@ -80,11 +81,65 @@ def normalize_pandascore(items):
     return rows
 
 
+def normalize_kashrock(data):
+    """Convert KashRock matches response into the app's common table format."""
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        candidates = data.get("matches") or data.get("data") or data.get("results") or []
+        # Some responses return one match as the top-level object.
+        if not candidates and (data.get("team1") or data.get("team2") or data.get("kr_match_id")):
+            candidates = [data]
+    else:
+        candidates = []
+
+    rows = []
+    for m in candidates:
+        if not isinstance(m, dict):
+            continue
+        a = m.get("team1") or m.get("team_a") or m.get("home_team") or "TBD"
+        b = m.get("team2") or m.get("team_b") or m.get("away_team") or "TBD"
+        if isinstance(a, dict):
+            a = a.get("name") or "TBD"
+        if isinstance(b, dict):
+            b = b.get("name") or "TBD"
+        rows.append({
+            "Trận": f"{a} vs {b}",
+            "Đội A": a, "Đội B": b,
+            "Giải": m.get("tournament") or m.get("league") or m.get("event_name") or "Chưa rõ",
+            "Bắt đầu (UTC)": m.get("event_time") or m.get("start_time") or m.get("begin_at") or "Chưa công bố",
+            "Trạng thái": m.get("status") or "upcoming",
+            "Thể thức": m.get("format") or m.get("match_type") or "Chưa rõ",
+            "Nguồn": "KashRock",
+        })
+    return rows
+
+
 def load_matches(game):
-    # Cito is used for LoL if a Cito key exists; otherwise PandaScore is tried.
+    kash_key = secret("KASHROCK_API_KEY")
     cito_key = secret("CITO_API_KEY")
     panda_key = secret("PANDASCORE_TOKEN")
     errors = []
+
+    # KashRock is the primary source.
+    if kash_key:
+        try:
+            slug = GAMES[game]["kash_slug"]
+            data = get_json(
+                f"{KASHROCK_BASE}/{slug}/matches",
+                headers={"X-API-Key": kash_key, "Accept": "application/json"},
+                params={"status": "upcoming", "limit": 100},
+            )
+            rows = normalize_kashrock(data)
+            if rows:
+                return rows, None, data
+            hint = data.get("hint") if isinstance(data, dict) else None
+            reason = data.get("reason") if isinstance(data, dict) else None
+            return [], f"KashRock chưa trả về trận sắp tới. {reason or ''} {hint or ''}".strip(), data
+        except Exception as e:
+            errors.append(f"KashRock: {e}")
+
+    # Optional legacy fallback: Cito for LoL.
     if game == "League of Legends" and cito_key:
         try:
             data = get_json(
@@ -92,52 +147,36 @@ def load_matches(game):
                 headers={"x-api-key": cito_key, "Accept": "application/json"},
                 params={"leagueSlug": "worlds"},
             )
-            # Cito's response schema may vary by plan/version. Keep raw response available.
-            if isinstance(data, dict):
-                candidates = data.get("matches") or data.get("data") or data.get("results") or []
-            elif isinstance(data, list):
-                candidates = data
-            else:
-                candidates = []
+            candidates = data.get("matches") or data.get("data") or data.get("results") or [] if isinstance(data, dict) else (data if isinstance(data, list) else [])
             rows = []
             for m in candidates:
                 teams = m.get("teams") or m.get("opponents") or []
-                names = []
-                for t in teams:
-                    if isinstance(t, dict):
-                        names.append(t.get("name") or (t.get("team") or {}).get("name") or "TBD")
+                names = [t.get("name") or (t.get("team") or {}).get("name") or "TBD" for t in teams if isinstance(t, dict)]
                 a = m.get("homeTeam") or m.get("home_team") or (names[0] if names else "TBD")
                 b = m.get("awayTeam") or m.get("away_team") or (names[1] if len(names) > 1 else "TBD")
                 if isinstance(a, dict): a = a.get("name", "TBD")
                 if isinstance(b, dict): b = b.get("name", "TBD")
-                rows.append({
-                    "Trận": f"{a} vs {b}", "Đội A": a, "Đội B": b,
-                    "Giải": m.get("leagueName") or m.get("league_name") or m.get("league", {}).get("name", "LoL Esports"),
+                rows.append({"Trận": f"{a} vs {b}", "Đội A": a, "Đội B": b,
+                    "Giải": m.get("leagueName") or m.get("league_name") or "LoL Esports",
                     "Bắt đầu (UTC)": m.get("startTime") or m.get("begin_at") or m.get("start_time") or "Chưa rõ",
-                    "Trạng thái": m.get("status") or "upcoming",
-                    "Thể thức": m.get("matchType") or m.get("match_type") or "Chưa rõ",
-                    "Nguồn": "Cito API",
-                })
+                    "Trạng thái": m.get("status") or "upcoming", "Thể thức": m.get("matchType") or m.get("match_type") or "Chưa rõ", "Nguồn": "Cito API"})
             if rows:
                 return rows, None, data
-            # A valid response with a different schema is shown in raw JSON to help diagnose.
-            return [], "Cito API trả về dữ liệu nhưng chưa nhận diện được cấu trúc trận đấu.", data
+            errors.append("Cito API không trả về trận theo cấu trúc dự kiến")
         except Exception as e:
             errors.append(f"Cito API: {e}")
+
     if panda_key:
-        slug = GAMES[game]["panda_slug"]
         try:
-            data = get_json(
-                f"{PANDASCORE_BASE}/{slug}/matches/upcoming",
-                headers={"Authorization": f"Bearer {panda_key}"},
-                params={"per_page": 100},
-            )
+            slug = GAMES[game]["panda_slug"]
+            data = get_json(f"{PANDASCORE_BASE}/{slug}/matches/upcoming", headers={"Authorization": f"Bearer {panda_key}"}, params={"per_page": 100})
             return normalize_pandascore(data), None, data
         except Exception as e:
             errors.append(f"PandaScore: {e}")
-    if not cito_key and not panda_key:
-        return [], "Chưa cấu hình API key. Hãy thêm CITO_API_KEY (LoL) hoặc PANDASCORE_TOKEN (cả 3 game) trong Streamlit Secrets.", None
-    return [], " Không tải được lịch. " + " | ".join(errors), None
+
+    if not kash_key and not cito_key and not panda_key:
+        return [], "Chưa cấu hình API key. Thêm KASHROCK_API_KEY trong Streamlit Secrets.", None
+    return [], "Không tải được lịch. " + " | ".join(errors), None
 
 
 tab_schedule, tab_predict, tab_setup = st.tabs(["📅 Trận sắp tới", "🔮 Dự đoán trận", "⚙️ Cấu hình API"])
@@ -199,9 +238,9 @@ with tab_predict:
 with tab_setup:
     st.subheader("Thêm API key an toàn")
     st.write("Trong Streamlit Cloud: mở app → Settings → Secrets. Không đăng key lên GitHub và không gửi key trong chat.")
-    st.code('CITO_API_KEY = "key_cua_ban"\nPANDASCORE_TOKEN = "token_cua_ban"', language="toml")
-    st.markdown("- **Cito API**: lịch LoL. Tài liệu: https://lolesportsapi.com/docs/api/league-of-legends/\n- **PandaScore**: lịch VALORANT, CS2 và LoL; cần token có quyền endpoint tương ứng: https://developers.pandascore.co/")
-    st.caption("Nếu không có token PandaScore, app vẫn chạy nhưng không thể tự lấy lịch VALORANT/CS2 từ nguồn này.")
+    st.code('KASHROCK_API_KEY = "dan_key_cua_ban"', language="toml")
+    st.markdown("- **KashRock**: lịch trận sắp tới cho LoL, VALORANT và CS2. Tài liệu: https://www.kashrock.com/docs/endpoints/matches")
+    st.caption("KashRock là nguồn ưu tiên. Cito/PandaScore chỉ được dùng làm phương án dự phòng nếu bạn đã cấu hình các key đó.")
 
 st.divider()
 st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Mô hình dự đoán là tham khảo, không phải bảo đảm kết quả hoặc lời khuyên cá cược.")
