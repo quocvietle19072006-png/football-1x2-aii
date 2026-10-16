@@ -1,240 +1,298 @@
 import os
-from datetime import datetime, timezone
-
+import math
 import requests
 import streamlit as st
+from datetime import datetime
 
-st.set_page_config(page_title="Esports Kèo Predictor Free", page_icon="🎮", layout="wide")
-st.title("🎮 Esports — Phân tích kèo miễn phí")
-st.caption("VALORANT · League of Legends · CS2 | Chỉ dùng dữ liệu API thật; không tự bịa odds hoặc xác suất.")
+st.set_page_config(page_title="Esports Match Predictor", page_icon="🎮", layout="wide")
+st.title("🎮 Esports Match Predictor")
+st.caption("Lịch thi đấu sắp tới và xác suất thắng tham khảo cho VALORANT, CS2 và League of Legends.")
 
-BASE = "https://kashrock.up.railway.app/v6/esports"
-SPORTS = {"VALORANT": "valorant", "League of Legends": "lol", "Counter-Strike 2": "cs2"}
+KASHROCK_BASE = "https://kashrock.up.railway.app/v6/esports"
+CITO_BASE = "https://api.citoapi.com/api/v1"
+PANDASCORE_BASE = "https://api.pandascore.co"
+
+# These are fallback ratings only, not live rankings. Unknown teams start at 1500.
+DEFAULT_RATINGS = {
+    "Gen.G": 1740, "T1": 1725, "Hanwha Life Esports": 1685,
+    "KT Rolster": 1640, "Dplus KIA": 1600, "Bilibili Gaming": 1710,
+    "Top Esports": 1665, "Anyone's Legend": 1615, "JD Gaming": 1590,
+    "Weibo Gaming": 1575, "G2 Esports": 1600, "Fnatic": 1535,
+    "Movistar KOI": 1510, "FlyQuest": 1550, "Team Liquid": 1540,
+    "Cloud9": 1500, "GAM Esports": 1480, "PSG Talon": 1490,
+    "Sentinels": 1650, "Fnatic VALORANT": 1600, "Paper Rex": 1660,
+    "EDward Gaming": 1640, "Team Heretics": 1600, "LOUD VALORANT": 1570,
+    "NAVI": 1600, "Vitality": 1660, "MOUZ": 1640, "FaZe Clan": 1620,
+    "Natus Vincere": 1600, "The MongolZ": 1610, "Team Spirit": 1670,
+    "G2 Esports CS2": 1640, "Aurora": 1620,
+}
+
+GAMES = {
+    "League of Legends": {"kash_slug": "lol", "panda_slug": "lol", "cito_path": "/lol/schedule/upcoming"},
+    "VALORANT": {"kash_slug": "valorant", "panda_slug": "valorant", "cito_path": None},
+    "Counter-Strike 2": {"kash_slug": "cs2", "panda_slug": "csgo", "cito_path": None},
+}
 
 
-def api_key():
+def secret(name):
     try:
-        return str(st.secrets.get("KASHROCK_API_KEY", "")).strip()
+        return str(st.secrets.get(name, "")).strip()
     except Exception:
-        return os.getenv("KASHROCK_API_KEY", "").strip()
+        return os.getenv(name, "").strip()
 
 
-def request_json(path, params=None):
-    key = api_key()
-    if not key:
-        raise RuntimeError("Thiếu KASHROCK_API_KEY trong Streamlit Cloud → Settings → Secrets.")
-    r = requests.get(f"{BASE}/{path.lstrip('/')}", headers={"X-API-Key": key, "Accept": "application/json"}, params=params or {}, timeout=25)
-    if r.status_code == 401:
-        raise RuntimeError("KashRock trả 401: kiểm tra API key trong Secrets.")
-    if r.status_code == 403:
-        raise RuntimeError("KashRock trả 403: gói/key không có quyền endpoint này. App không thể tự lấy dữ liệu bị khóa.")
-    if r.status_code == 429:
-        raise RuntimeError("Đã chạm giới hạn API. Hãy đợi rồi tải lại.")
+def elo_prob(r_a, r_b):
+    return 1 / (1 + 10 ** ((r_b - r_a) / 400))
+
+
+def series_prob(p, best_of):
+    needed = best_of // 2 + 1
+    return sum(math.comb(best_of, k) * p**k * (1-p)**(best_of-k)
+               for k in range(needed, best_of + 1))
+
+
+def get_json(url, headers=None, params=None):
+    r = requests.get(url, headers=headers or {}, params=params or {}, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-def records(data, preferred=()):
+def normalize_pandascore(items):
+    rows = []
+    for m in items if isinstance(items, list) else []:
+        opponents = m.get("opponents") or []
+        names = []
+        for op in opponents:
+            team = op.get("opponent") or {}
+            names.append(team.get("name") or "TBD")
+        if len(names) < 2:
+            names = (names + ["TBD", "TBD"])[:2]
+        league = m.get("league") or {}
+        serie = m.get("serie") or {}
+        rows.append({
+            "Trận": f"{names[0]} vs {names[1]}",
+            "Đội A": names[0], "Đội B": names[1],
+            "Giải": league.get("name") or serie.get("full_name") or "Chưa rõ",
+            "Bắt đầu (UTC)": m.get("begin_at") or "Chưa công bố",
+            "Trạng thái": m.get("status") or "Chưa rõ",
+            "Thể thức": m.get("match_type") or "Chưa rõ",
+            "Nguồn": "PandaScore",
+        })
+    return rows
+
+
+def normalize_kashrock(data):
+    """Convert KashRock matches response into the app's common table format."""
     if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for k in (*preferred, "data", "results", "matches", "props", "items", "events", "offers"):
-            v = data.get(k)
-            if isinstance(v, list):
-                return v
-    return []
+        candidates = data
+    elif isinstance(data, dict):
+        candidates = data.get("matches") or data.get("data") or data.get("results") or []
+        # Some responses return one match as the top-level object.
+        if not candidates and (data.get("team1") or data.get("team2") or data.get("kr_match_id")):
+            candidates = [data]
+    else:
+        candidates = []
 
-
-def first(d, *keys, default="—"):
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, ""):
-            if isinstance(v, dict):
-                return v.get("name") or v.get("title") or default
-            return v
-    return default
-
-
-def team_name(v):
-    if isinstance(v, dict):
-        return str(v.get("name") or v.get("team_name") or "TBD")
-    return str(v or "TBD")
-
-
-def normalize_match(m):
-    a = first(m, "team1", "team_a", "home_team", "opponent1", "team_home", default="TBD")
-    b = first(m, "team2", "team_b", "away_team", "opponent2", "team_away", default="TBD")
-    teams = m.get("teams") if isinstance(m.get("teams"), list) else []
-    if a == "TBD" and teams:
-        a = team_name(teams[0])
-    if b == "TBD" and len(teams) > 1:
-        b = team_name(teams[1])
-    return {"Trận": f"{a} vs {b}", "Đội A": a, "Đội B": b,
-            "Giải": first(m, "competition", "tournament", "league", "event_name"),
-            "Giờ bắt đầu": first(m, "event_time", "begin_at", "start_time", "scheduled_at"),
-            "Trạng thái": first(m, "status", default="upcoming"),
-            "Thể thức": first(m, "format", "best_of", "match_type"),
-            "ID": first(m, "kr_match_id", "match_id", "id", default=""), "raw": m}
-
-
-def fmt_time(v):
-    if not v or v == "—":
-        return "Chưa công bố"
-    try:
-        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d.astimezone().strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        return str(v)
-
-
-def normalize_prob(value):
-    try:
-        p = float(value)
-        if p > 1 and p <= 100:
-            p /= 100
-        return p if 0 < p < 1 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def decimal_odds(value, raw=None):
-    # Only accept explicit decimal odds. Never guess odds format from absent data.
-    candidates = [value]
-    if isinstance(raw, dict):
-        candidates += [raw.get(k) for k in ("decimal_odds", "odds_decimal", "price_decimal")]
-    for v in candidates:
-        try:
-            if isinstance(v, str):
-                v = v.strip().replace(",", ".")
-            x = float(v)
-            if 1.0 < x < 1000:
-                return x
-        except (TypeError, ValueError):
+    rows = []
+    for m in candidates:
+        if not isinstance(m, dict):
             continue
-    return None
+        a = m.get("team1") or m.get("team_a") or m.get("home_team") or "TBD"
+        b = m.get("team2") or m.get("team_b") or m.get("away_team") or "TBD"
+        if isinstance(a, dict):
+            a = a.get("name") or "TBD"
+        if isinstance(b, dict):
+            b = b.get("name") or "TBD"
+        rows.append({
+            "Trận": f"{a} vs {b}",
+            "Đội A": a, "Đội B": b,
+            "Giải": m.get("tournament") or m.get("league") or m.get("event_name") or "Chưa rõ",
+            "Bắt đầu (UTC)": m.get("event_time") or m.get("start_time") or m.get("begin_at") or "Chưa công bố",
+            "Trạng thái": m.get("status") or "upcoming",
+            "Thể thức": m.get("format") or m.get("match_type") or "Chưa rõ",
+            "Nguồn": "KashRock",
+        })
+    return rows
 
 
-def normalize_prop(p):
-    player = first(p, "player_name", "player", "athlete_name", default="")
-    team = first(p, "team", "team_name", default="")
-    opponent = first(p, "opponent", "opponent_name", default="")
-    market = first(p, "stat_type", "market", "market_name", "prop_type", "name", default="Thị trường")
-    line = first(p, "line", "line_value", "target", default="—")
-    direction = first(p, "direction", "selection", "side", "outcome", default="—")
-    odds_value = first(p, "decimal_odds", "odds_decimal", "price_decimal", "odds", "price", default=None)
-    probability_value = first(p, "model_probability", "probability", "win_probability", "p_over", default=None)
-    event = first(p, "event_time", "start_time", "begin_at", default="—")
-    match = first(p, "match_name", "event_name", default="")
-    probability = normalize_prob(probability_value)
-    odds = decimal_odds(odds_value, p)
-    ev = (probability * odds - 1) if probability is not None and odds is not None else None
-    if probability is None or odds is None:
-        recommendation = "Chưa đủ dữ liệu để đánh giá"
-    elif ev > 0.03:
-        recommendation = "Có thể nghiên cứu thêm (EV dương theo xác suất API)"
+def load_matches(game):
+    kash_key = secret("KASHROCK_API_KEY")
+    cito_key = secret("CITO_API_KEY")
+    panda_key = secret("PANDASCORE_TOKEN")
+    errors = []
+
+    # KashRock is the primary source.
+    if kash_key:
+        try:
+            slug = GAMES[game]["kash_slug"]
+            data = get_json(
+                f"{KASHROCK_BASE}/{slug}/matches",
+                headers={"X-API-Key": kash_key, "Accept": "application/json"},
+                params={"status": "upcoming", "limit": 100},
+            )
+            rows = normalize_kashrock(data)
+            if rows:
+                return rows, None, data
+            hint = data.get("hint") if isinstance(data, dict) else None
+            reason = data.get("reason") if isinstance(data, dict) else None
+            return [], f"KashRock chưa trả về trận sắp tới. {reason or ''} {hint or ''}".strip(), data
+        except Exception as e:
+            errors.append(f"KashRock: {e}")
+
+    # Optional legacy fallback: Cito for LoL.
+    if game == "League of Legends" and cito_key:
+        try:
+            data = get_json(
+                CITO_BASE + "/lol/schedule/upcoming",
+                headers={"x-api-key": cito_key, "Accept": "application/json"},
+                params={"leagueSlug": "worlds"},
+            )
+            candidates = data.get("matches") or data.get("data") or data.get("results") or [] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            rows = []
+            for m in candidates:
+                teams = m.get("teams") or m.get("opponents") or []
+                names = [t.get("name") or (t.get("team") or {}).get("name") or "TBD" for t in teams if isinstance(t, dict)]
+                a = m.get("homeTeam") or m.get("home_team") or (names[0] if names else "TBD")
+                b = m.get("awayTeam") or m.get("away_team") or (names[1] if len(names) > 1 else "TBD")
+                if isinstance(a, dict): a = a.get("name", "TBD")
+                if isinstance(b, dict): b = b.get("name", "TBD")
+                rows.append({"Trận": f"{a} vs {b}", "Đội A": a, "Đội B": b,
+                    "Giải": m.get("leagueName") or m.get("league_name") or "LoL Esports",
+                    "Bắt đầu (UTC)": m.get("startTime") or m.get("begin_at") or m.get("start_time") or "Chưa rõ",
+                    "Trạng thái": m.get("status") or "upcoming", "Thể thức": m.get("matchType") or m.get("match_type") or "Chưa rõ", "Nguồn": "Cito API"})
+            if rows:
+                return rows, None, data
+            errors.append("Cito API không trả về trận theo cấu trúc dự kiến")
+        except Exception as e:
+            errors.append(f"Cito API: {e}")
+
+    if panda_key:
+        try:
+            slug = GAMES[game]["panda_slug"]
+            data = get_json(f"{PANDASCORE_BASE}/{slug}/matches/upcoming", headers={"Authorization": f"Bearer {panda_key}"}, params={"per_page": 100})
+            return normalize_pandascore(data), None, data
+        except Exception as e:
+            errors.append(f"PandaScore: {e}")
+
+    if not kash_key and not cito_key and not panda_key:
+        return [], "Chưa cấu hình API key. Thêm KASHROCK_API_KEY trong Streamlit Secrets.", None
+    return [], "Không tải được lịch. " + " | ".join(errors), None
+
+
+tab_schedule, tab_predict, tab_setup = st.tabs(["📅 Trận sắp tới", "🔮 Dự đoán trận", "⚙️ Cấu hình API"])
+
+with tab_schedule:
+    game = st.selectbox("Chọn game", list(GAMES.keys()), key="schedule_game")
+    if st.button("🔄 Tải/cập nhật lịch", type="primary"):
+        st.session_state["match_cache"] = {}
+        rows, error, raw = load_matches(game)
+        st.session_state["match_cache"][game] = {"rows": rows, "error": error, "raw": raw}
+    cached = st.session_state.get("match_cache", {}).get(game)
+    if cached:
+        if cached["rows"]:
+            st.success(f"Đã tải {len(cached['rows'])} trận từ {cached['rows'][0]['Nguồn']}.")
+            st.dataframe([{k: v for k, v in r.items() if k not in ("Đội A", "Đội B")} for r in cached["rows"]], use_container_width=True, hide_index=True)
+            st.session_state["loaded_matches"] = cached["rows"]
+        if cached["error"]:
+            st.warning(cached["error"])
+            if cached["raw"] is not None:
+                with st.expander("Xem phản hồi API gốc"):
+                    st.json(cached["raw"])
     else:
-        recommendation = "Không ưu tiên / NO BET"
-    return {"Trận": match or (f"{team} vs {opponent}" if team and opponent else "Chưa ghép được trận"),
-            "Người chơi": player or "—", "Đội": team or "—", "Thị trường": str(market),
-            "Mốc": line, "Lựa chọn": str(direction), "Odds thập phân thật": odds if odds is not None else "API không cung cấp",
-            "Giờ bắt đầu": fmt_time(event), "Xác suất từ API": probability,
-            "EV ước tính": ev, "Gợi ý": recommendation, "raw": p}
+        st.info("Chọn game rồi nhấn **Tải/cập nhật lịch** để lấy lịch mới nhất qua API.")
 
+def sync_selected_match():
+    """Copy selected match names into text inputs when the selected match changes."""
+    loaded_now = st.session_state.get("loaded_matches", [])
+    selected_now = st.session_state.get("selected_match_predict")
+    for item in loaded_now:
+        if item.get("Trận") == selected_now:
+            st.session_state["predict_a"] = item.get("Đội A", "TBD")
+            st.session_state["predict_b"] = item.get("Đội B", "TBD")
+            break
 
-def fetch_matches(sport):
-    data = request_json(f"{sport}/matches", {"status": "upcoming", "limit": 100})
-    out = []
-    for item in records(data, ("matches",)):
-        if isinstance(item, dict):
-            m = normalize_match(item)
-            if m["Đội A"] != "TBD" or m["Đội B"] != "TBD":
-                out.append(m)
-    return out, data
-
-
-def fetch_props(sport):
-    data = request_json(f"{sport}/props", {"limit": 100})
-    out = [normalize_prop(x) for x in records(data, ("props", "items", "offers")) if isinstance(x, dict)]
-    return out, data
-
-with st.sidebar:
-    st.subheader("Cài đặt")
-    game = st.radio("🎮 Chọn riêng từng game", list(SPORTS.keys()), key="selected_game")
-    view = st.radio("Chức năng", ["Dự đoán kèo", "Trận sắp tới", "Thị trường / props thật"])
-    load = st.button("🔄 Tải dữ liệu", type="primary", use_container_width=True)
-    st.caption("Miễn phí: chỉ phân tích odds/xác suất nếu API thực sự trả về. Không tự tạo dữ liệu còn thiếu.")
-
-st.subheader(f"🎮 Khu vực riêng: {game}")
-st.caption("Dữ liệu lịch trận, thị trường và phân tích bên dưới chỉ áp dụng cho game đang chọn.")
-sport = SPORTS[game]
-view_to_endpoint = {"Dự đoán kèo": "props", "Thị trường / props thật": "props", "Trận sắp tới": "matches"}
-endpoint = view_to_endpoint[view]
-cache_key = f"{sport}_{endpoint}"
-if load or cache_key not in st.session_state:
-    try:
-        with st.spinner("Đang tải dữ liệu từ KashRock..."):
-            if endpoint == "matches":
-                data_rows, raw = fetch_matches(sport)
-            else:
-                data_rows, raw = fetch_props(sport)
-        st.session_state[cache_key] = data_rows
-        st.session_state[cache_key + "_raw"] = raw
-        st.session_state.pop(cache_key + "_error", None)
-    except Exception as e:
-        st.session_state[cache_key] = []
-        st.session_state[cache_key + "_error"] = str(e)
-
-if st.session_state.get(cache_key + "_error"):
-    st.error(st.session_state[cache_key + "_error"])
-rows = st.session_state.get(cache_key, [])
-
-if view == "Trận sắp tới":
-    st.subheader(f"📅 Trận sắp tới — {game}")
-    if rows:
-        st.success(f"API trả về {len(rows)} trận.")
-        st.dataframe([{"Trận": x["Trận"], "Giải": x["Giải"], "Bắt đầu": fmt_time(x["Giờ bắt đầu"]), "Trạng thái": x["Trạng thái"], "Thể thức": x["Thể thức"]} for x in rows], use_container_width=True, hide_index=True)
+with tab_predict:
+    st.subheader("🔮 Dự đoán trận và gợi ý thị trường")
+    loaded = st.session_state.get("loaded_matches", [])
+    if loaded:
+        options = [r["Trận"] for r in loaded]
+        if "selected_match_predict" not in st.session_state or st.session_state["selected_match_predict"] not in options:
+            st.session_state["selected_match_predict"] = options[0]
+            first_match = next(r for r in loaded if r["Trận"] == options[0])
+            st.session_state["predict_a"] = first_match.get("Đội A", "TBD")
+            st.session_state["predict_b"] = first_match.get("Đội B", "TBD")
+        selected = st.selectbox("Chọn trận từ lịch đã tải", options, key="selected_match_predict", on_change=sync_selected_match)
+        match = next(r for r in loaded if r["Trận"] == selected)
+        st.caption(f"Giải: {match['Giải']} · Bắt đầu UTC: {match['Bắt đầu (UTC)']} · Nguồn: {match['Nguồn']}")
     else:
-        st.info("API không trả về trận sắp tới cho game này. Hãy thử tải lại sau.")
-elif view == "Thị trường / props thật":
-    st.subheader(f"📊 Thị trường / props thật — {game}")
-    if rows:
-        st.success(f"API trả về {len(rows)} mục thị trường/props.")
-        st.dataframe([{k: r[k] for k in ("Trận", "Người chơi", "Đội", "Thị trường", "Mốc", "Lựa chọn", "Odds thập phân thật", "Xác suất từ API")} for r in rows], use_container_width=True, hide_index=True)
-        for r in rows[:30]:
-            with st.expander(f"{r['Trận']} · {r['Thị trường']} · {r['Lựa chọn']} {r['Mốc']}"):
-                st.write(f"**Odds:** {r['Odds thập phân thật']} · **Xác suất API:** {r['Xác suất từ API'] if r['Xác suất từ API'] is not None else 'Không có'}")
-                st.json(r["raw"])
-    else:
-        st.info("API không trả về props cho game này, hoặc endpoint bị giới hạn bởi gói/key.")
-else:
-    st.subheader(f"🔮 Dự đoán và gợi ý kèo — {game}")
-    st.write("App chỉ xếp hạng kèo khi có **cả odds thập phân thật và xác suất do API cung cấp**. Nếu thiếu một trong hai, app không tự đoán.")
-    if rows:
-        usable = [r for r in rows if r["EV ước tính"] is not None]
-        if usable:
-            ranked = sorted(usable, key=lambda r: r["EV ước tính"], reverse=True)
-            positive = [r for r in ranked if r["EV ước tính"] > 0.03]
-            if positive:
-                st.success(f"Có {len(positive)} lựa chọn có EV ước tính trên 3% theo xác suất API. Đây không phải cam kết thắng.")
-            else:
-                st.warning("Chưa có lựa chọn nào vượt ngưỡng EV 3%. Gợi ý hiện tại: NO BET.")
-            st.dataframe([{"Trận": r["Trận"], "Thị trường": r["Thị trường"], "Lựa chọn": r["Lựa chọn"], "Mốc": r["Mốc"], "Odds": r["Odds thập phân thật"], "Xác suất API": f"{r['Xác suất từ API']*100:.1f}%", "EV": f"{r['EV ước tính']*100:+.1f}%", "Gợi ý": r["Gợi ý"]} for r in ranked], use_container_width=True, hide_index=True)
-            for r in ranked[:20]:
-                with st.expander(f"{r['Gợi ý']} — {r['Trận']} / {r['Thị trường']}"):
-                    st.write(f"Lựa chọn: **{r['Lựa chọn']} {r['Mốc']}** · Odds: **{r['Odds thập phân thật']}** · Xác suất API: **{r['Xác suất từ API']*100:.1f}%** · EV: **{r['EV ước tính']*100:+.1f}%**")
-                    st.caption("EV = xác suất × odds thập phân − 1. Chỉ đáng tham khảo nếu xác suất API đã được kiểm định và cùng thị trường với odds.")
+        st.info("Tải lịch ở tab **Trận sắp tới** trước, hoặc nhập hai đội thủ công.")
+        st.session_state.setdefault("predict_a", "")
+        st.session_state.setdefault("predict_b", "")
+
+    team_a = st.text_input("Đội A", key="predict_a", placeholder="Tên đội A")
+    team_b = st.text_input("Đội B", key="predict_b", placeholder="Tên đội B")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        elo_a = st.slider("Sức mạnh A (Elo tham khảo)", 1000, 2000, int(DEFAULT_RATINGS.get(team_a, 1500)), 5, key="elo_a")
+    with col_b:
+        elo_b = st.slider("Sức mạnh B (Elo tham khảo)", 1000, 2000, int(DEFAULT_RATINGS.get(team_b, 1500)), 5, key="elo_b")
+    bo = st.selectbox("Thể thức series", [1, 3, 5], index=1, format_func=lambda x: f"BO{x}")
+    st.caption("Không nhập odds giả. App chỉ tính xác suất tham khảo; value chỉ đánh giá được khi có odds thật từ nguồn dữ liệu.")
+
+    if st.button("🔮 Phân tích và gợi ý kèo", type="primary"):
+        if not team_a.strip() or not team_b.strip() or team_a.strip().lower() == team_b.strip().lower():
+            st.error("Nhập tên hai đội khác nhau trước khi dự đoán.")
         else:
-            st.warning("API có trả về mục thị trường, nhưng không có đủ cả odds thập phân và xác suất API để tính value. App không tự tạo dự đoán; hiện nên NO BET.")
-        missing = len(rows) - len(usable)
-        if missing:
-            st.caption(f"{missing} mục bị loại khỏi xếp hạng vì thiếu odds hoặc xác suất.")
-    else:
-        st.info("Chưa có dữ liệu thị trường/props. Hãy thử tab ‘Thị trường / props thật’ hoặc tải lại sau; nếu API trả 403 thì gói miễn phí không có quyền endpoint đó.")
+            p_map_a = elo_prob(elo_a, elo_b)
+            p_series_a = series_prob(p_map_a, bo)
+            p_series_b = 1 - p_series_a
+            st.markdown("### Xác suất thắng series")
+            c1, c2 = st.columns(2)
+            c1.metric(f"{team_a} thắng", f"{p_series_a*100:.1f}%")
+            c2.metric(f"{team_b} thắng", f"{p_series_b*100:.1f}%")
+            st.progress(max(0, min(100, round(p_series_a*100))))
 
-with st.expander("Nguồn dữ liệu và giới hạn"):
-    st.markdown("- Nguồn: KashRock API, bằng API key do bạn cấu hình.\n- App chỉ đề xuất lựa chọn khi API cung cấp cả odds và xác suất.\n- Không suy ra kèo chấp, tổng map/round hay xác suất từ lịch trận đơn thuần.\n- EV dương không bảo đảm có lời; dữ liệu/API có thể thiếu hoặc không cùng thời điểm.")
-with st.expander("Cấu hình API key"):
-    st.code('KASHROCK_API_KEY = "API_KEY_CUA_BAN"', language="toml")
-    st.caption("Streamlit Cloud → App → Settings → Secrets. Không đưa API key lên GitHub hoặc chat.")
+            st.markdown("### Phân tích các thị trường")
+            favorite = team_a if p_series_a >= p_series_b else team_b
+            st.write(f"**1) Thắng trận:** ưu tiên {favorite} ({max(p_series_a, p_series_b)*100:.1f}% theo Elo tham khảo).")
+            if bo == 1:
+                st.write("**2) Handicap / Tài Xỉu / tỷ số series:** không áp dụng cho trận BO1; cần odds và line thực tế để đánh giá value.")
+            else:
+                p = p_map_a
+                q = 1 - p
+                need = bo // 2 + 1
+                # Probability of an exact series score under independent-map Elo assumptions.
+                exact = []
+                for wins_a in range(need):
+                    wins_b = need
+                    prob = math.comb(need + wins_a - 1, wins_a) * (p ** wins_a) * (q ** need)
+                    exact.append((f"{team_b} {need}-{wins_a} {team_a}", prob))
+                for wins_b in range(need):
+                    wins_a = need
+                    prob = math.comb(need + wins_b - 1, wins_b) * (q ** wins_b) * (p ** need)
+                    exact.append((f"{team_a} {need}-{wins_b} {team_b}", prob))
+                exact.sort(key=lambda x: x[1], reverse=True)
+                if bo == 3:
+                    p_over = 2 * p * q
+                    st.write(f"**2) Tổng map 2.5:** Tài 2.5 (đủ 3 map) {p_over*100:.1f}% · Xỉu 2.5 (kết thúc 2–0) {(1-p_over)*100:.1f}%.")
+                    st.write(f"**3) Handicap map ±1.5:** {team_a} -1.5 / thắng 2–0: {p*p*100:.1f}%; {team_b} -1.5 / thắng 2–0: {q*q*100:.1f}%.")
+                else:
+                    p_over_3 = 1 - (p**3 + q**3)
+                    st.write(f"**2) Tổng map 3.5:** Tài 3.5 (4 hoặc 5 map) khoảng {p_over_3*100:.1f}% theo mô hình Elo đơn giản.")
+                    st.write("**3) Handicap map:** xác suất thắng cách biệt phụ thuộc kết quả từng map; đây chỉ là xấp xỉ, không thay thế line thực tế.")
+                st.write("**4) Tỷ số chính xác — các kết quả có xác suất mô hình cao nhất:**")
+                for score, prob in exact[:4]:
+                    st.write(f"- {score}: {prob*100:.1f}%")
+            st.markdown("#### Value cược")
+            st.info("Chưa đánh giá được value vì chưa có odds thật được lấy tự động từ nguồn API hiện tại. Không dùng odds giả định.")
+            st.warning("Giới hạn hiện tại: xác suất dựa trên Elo tham khảo, chưa học từ phong độ gần đây, đội hình, bản đồ, patch hay odds thị trường. Không xem đây là dự đoán chắc thắng; chỉ dùng để tham khảo.")
+
+with tab_setup:
+    st.subheader("Thêm API key an toàn")
+    st.write("Trong Streamlit Cloud: mở app → Settings → Secrets. Không đăng key lên GitHub và không gửi key trong chat.")
+    st.code('KASHROCK_API_KEY = "dan_key_cua_ban"', language="toml")
+    st.markdown("- **KashRock**: lịch trận sắp tới cho LoL, VALORANT và CS2. Tài liệu: https://www.kashrock.com/docs/endpoints/matches")
+    st.caption("KashRock là nguồn ưu tiên. Cito/PandaScore chỉ được dùng làm phương án dự phòng nếu bạn đã cấu hình các key đó.")
+
+st.divider()
+st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Gợi ý kèo chỉ là ước tính theo Elo tham khảo; chưa phải mô hình đã được kiểm định và không bảo đảm lợi nhuận.")
