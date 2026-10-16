@@ -201,39 +201,84 @@ with tab_schedule:
     else:
         st.info("Chọn game rồi nhấn **Tải/cập nhật lịch** để lấy lịch mới nhất qua API.")
 
+def sync_selected_match():
+    """Copy selected match names into text inputs when the selected match changes."""
+    loaded_now = st.session_state.get("loaded_matches", [])
+    selected_now = st.session_state.get("selected_match_predict")
+    for item in loaded_now:
+        if item.get("Trận") == selected_now:
+            st.session_state["predict_a"] = item.get("Đội A", "TBD")
+            st.session_state["predict_b"] = item.get("Đội B", "TBD")
+            break
+
 with tab_predict:
-    st.subheader("Tính xác suất thắng")
+    st.subheader("🔮 Dự đoán trận và gợi ý thị trường")
     loaded = st.session_state.get("loaded_matches", [])
     if loaded:
         options = [r["Trận"] for r in loaded]
-        selected = st.selectbox("Chọn trận từ lịch đã tải", options)
+        if "selected_match_predict" not in st.session_state or st.session_state["selected_match_predict"] not in options:
+            st.session_state["selected_match_predict"] = options[0]
+            first_match = next(r for r in loaded if r["Trận"] == options[0])
+            st.session_state["predict_a"] = first_match.get("Đội A", "TBD")
+            st.session_state["predict_b"] = first_match.get("Đội B", "TBD")
+        selected = st.selectbox("Chọn trận từ lịch đã tải", options, key="selected_match_predict", on_change=sync_selected_match)
         match = next(r for r in loaded if r["Trận"] == selected)
-        a_default, b_default = match["Đội A"], match["Đội B"]
         st.caption(f"Giải: {match['Giải']} · Bắt đầu UTC: {match['Bắt đầu (UTC)']} · Nguồn: {match['Nguồn']}")
-        if a_default == "TBD" or b_default == "TBD":
-            st.warning("API chưa cung cấp đủ tên hai đội cho trận này; hãy nhập đội thủ công bên dưới.")
     else:
-        a_default, b_default = "Gen.G", "T1"
-        st.info("Chưa tải lịch. Bạn vẫn có thể nhập đội để xem ước tính.")
-    team_a = st.text_input("Đội A", value=a_default, key="predict_a")
-    team_b = st.text_input("Đội B", value=b_default, key="predict_b")
+        st.info("Tải lịch ở tab **Trận sắp tới** trước, hoặc nhập hai đội thủ công.")
+        st.session_state.setdefault("predict_a", "")
+        st.session_state.setdefault("predict_b", "")
+
+    team_a = st.text_input("Đội A", key="predict_a", placeholder="Tên đội A")
+    team_b = st.text_input("Đội B", key="predict_b", placeholder="Tên đội B")
     col_a, col_b = st.columns(2)
     with col_a:
-        elo_a = st.slider("Điểm sức mạnh A (Elo tham khảo)", 1000, 2000, DEFAULT_RATINGS.get(team_a, 1500), 5)
+        elo_a = st.slider("Sức mạnh A (Elo tham khảo)", 1000, 2000, int(DEFAULT_RATINGS.get(team_a, 1500)), 5, key="elo_a")
     with col_b:
-        elo_b = st.slider("Điểm sức mạnh B (Elo tham khảo)", 1000, 2000, DEFAULT_RATINGS.get(team_b, 1500), 5)
+        elo_b = st.slider("Sức mạnh B (Elo tham khảo)", 1000, 2000, int(DEFAULT_RATINGS.get(team_b, 1500)), 5, key="elo_b")
     bo = st.selectbox("Thể thức series", [1, 3, 5], index=1, format_func=lambda x: f"BO{x}")
-    if st.button("🔮 Tính dự đoán", type="primary"):
+    st.markdown("#### Giá cược hiện tại (nếu có) — nhập để kiểm tra value")
+    odds_col_a, odds_col_b = st.columns(2)
+    with odds_col_a:
+        odds_a = st.number_input(f"Odds thắng {team_a or 'đội A'}", min_value=1.01, max_value=100.0, value=1.90, step=0.05)
+    with odds_col_b:
+        odds_b = st.number_input(f"Odds thắng {team_b or 'đội B'}", min_value=1.01, max_value=100.0, value=1.90, step=0.05)
+
+    if st.button("🔮 Phân tích và gợi ý kèo", type="primary"):
         if not team_a.strip() or not team_b.strip() or team_a.strip().lower() == team_b.strip().lower():
-            st.error("Nhập tên hai đội khác nhau.")
+            st.error("Nhập tên hai đội khác nhau trước khi dự đoán.")
         else:
-            p = series_prob(elo_prob(elo_a, elo_b), bo)
+            p_map_a = elo_prob(elo_a, elo_b)
+            p_series_a = series_prob(p_map_a, bo)
+            p_series_b = 1 - p_series_a
+            st.markdown("### Xác suất thắng series")
             c1, c2 = st.columns(2)
-            c1.metric(f"{team_a} thắng", f"{p*100:.1f}%")
-            c2.metric(f"{team_b} thắng", f"{(1-p)*100:.1f}%")
-            st.progress(max(0, min(100, round(p*100))))
-            st.write(f"**Dự đoán theo Elo:** {team_a if p >= 0.5 else team_b} có xác suất cao hơn.")
-            st.warning("Lưu ý: xác suất hiện dùng điểm Elo tham khảo, không tự động suy ra phong độ từ lịch. Điểm cho đội chưa có trong danh sách mặc định là 1500; hãy điều chỉnh dựa trên kết quả gần đây.")
+            c1.metric(f"{team_a} thắng", f"{p_series_a*100:.1f}%")
+            c2.metric(f"{team_b} thắng", f"{p_series_b*100:.1f}%")
+            st.progress(max(0, min(100, round(p_series_a*100))))
+
+            # Expected value per unit stake, using user-entered decimal odds.
+            ev_a = p_series_a * odds_a - 1
+            ev_b = p_series_b * odds_b - 1
+            st.markdown("### Gợi ý kèo")
+            if bo == 1:
+                st.write(f"**Kèo thắng trận:** {team_a if p_series_a >= p_series_b else team_b} có xác suất cao hơn theo Elo.")
+            else:
+                st.write(f"**Kèo thắng series:** {team_a if p_series_a >= p_series_b else team_b} là lựa chọn có xác suất mô hình cao hơn.")
+                st.write(f"**Kèo tổng số map:** mô hình chỉ ước tính từ xác suất thắng từng map; không có dữ liệu lịch sử map nên chưa đủ cơ sở để khuyến nghị Over/Under đáng tin cậy.")
+                st.write(f"**Kèo tỷ số series:** {team_a} thắng {bo//2+1}-0 hoặc {team_b} thắng {bo//2+1}-0 có thể được tính riêng, nhưng hiện chưa có dữ liệu map đủ tốt để xếp hạng chính xác các tỷ số.")
+            st.markdown("#### Kiểm tra value theo odds bạn nhập")
+            v1, v2 = st.columns(2)
+            v1.metric(f"EV {team_a}", f"{ev_a*100:+.1f}%")
+            v2.metric(f"EV {team_b}", f"{ev_b*100:+.1f}%")
+            if max(ev_a, ev_b) > 0:
+                value_team = team_a if ev_a >= ev_b else team_b
+                value_ev = max(ev_a, ev_b)
+                if value_ev > 0:
+                    st.success(f"Theo các odds bạn nhập, {value_team} có EV dương ước tính ({value_ev*100:+.1f}%). Đây là tín hiệu cần kiểm tra thêm, không bảo đảm có lời.")
+            else:
+                st.warning("Chưa có kèo value theo mô hình ở mức odds đã nhập (EV không dương). Cân nhắc bỏ qua trận này.")
+            st.warning("Giới hạn hiện tại: xác suất dựa trên Elo tham khảo, chưa học từ phong độ gần đây, đội hình, bản đồ, patch hay odds thị trường. Không xem đây là dự đoán chắc thắng; chỉ dùng để tham khảo.")
 
 with tab_setup:
     st.subheader("Thêm API key an toàn")
@@ -243,4 +288,4 @@ with tab_setup:
     st.caption("KashRock là nguồn ưu tiên. Cito/PandaScore chỉ được dùng làm phương án dự phòng nếu bạn đã cấu hình các key đó.")
 
 st.divider()
-st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Mô hình dự đoán là tham khảo, không phải bảo đảm kết quả hoặc lời khuyên cá cược.")
+st.caption("Lịch được lấy trực tiếp khi bạn nhấn tải. Gợi ý kèo và EV chỉ là ước tính theo Elo cùng odds do bạn nhập; chưa phải mô hình đã được kiểm định và không bảo đảm lợi nhuận.")
